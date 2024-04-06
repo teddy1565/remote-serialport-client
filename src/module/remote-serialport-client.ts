@@ -13,10 +13,17 @@ import { MockBindingInterface, CreatePortOptions, MockBinding } from "@serialpor
 import { SerialPortStream, OpenOptions } from "@serialport/stream";
 import { BindingInterface } from "@serialport/bindings-interface";
 
+import EventEmitter from "events";
+
 export class RemoteSerialClientPortInstance extends AbsRemoteSerialportClientPortInstance {
     protected mock_binding: MockBindingInterface;
 
     protected port_path: string;
+
+    private _serialport_stream: SerialPortStream | null = null;
+
+    private _data_event_emitter: EventEmitter = new EventEmitter();
+
     /**
      * @param mock_binding - Mock Binding Instance
      * @param port_path - Serial Port Path
@@ -26,6 +33,11 @@ export class RemoteSerialClientPortInstance extends AbsRemoteSerialportClientPor
         super();
         this.mock_binding = mock_binding;
         this.port_path = port_path;
+        this._data_event_emitter.on("data", (data_chunk: Buffer | Array<number>) => {
+            if (this._serialport_stream !== null) {
+                this._serialport_stream.write(data_chunk);
+            }
+        });
     }
 
     /**
@@ -36,10 +48,17 @@ export class RemoteSerialClientPortInstance extends AbsRemoteSerialportClientPor
     public get_port(open_options: OpenOptoinsForSerialPortStream): SerialPortStream {
         if (open_options === undefined || open_options === null) {
             throw new Error("Invalid Open Options");
+        } else if (this._serialport_stream !== null) {
+            return this._serialport_stream;
         }
         open_options.binding = this.mock_binding;
         open_options.path = this.port_path;
-        return new SerialPortStream(open_options as OpenOptions<BindingInterface>);
+        this._serialport_stream = new SerialPortStream(open_options as OpenOptions<BindingInterface>);
+        return this._serialport_stream;
+    }
+
+    public write(data: Buffer): void {
+        this._data_event_emitter.emit("data", data);
     }
 }
 
@@ -50,6 +69,8 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
     protected _open_options: OpenSerialPortOptions;
 
     private _debug_mode: boolean = false;
+
+    private _remoteSerialClientPortInstance_map: Map<string, RemoteSerialClientPortInstance> = new Map();
 
     constructor(socket: Socket, open_options: OpenSerialPortOptions) {
         super();
@@ -71,6 +92,11 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
                 if (this._debug_mode === true) {
                     console.log("Serialport Init Result: ", data);
                 }
+                this.on("serialport_packet", (data_chunk) => {
+                    for(const [path, remote_serial_client_port_instance] of this._remoteSerialClientPortInstance_map) {
+                        remote_serial_client_port_instance.write(data_chunk as Buffer);
+                    }
+                });
             } else if (data.code === "serialport_init_result" && data.data === false) {
                 throw new Error("Serialport Init Failed");
             } else {
@@ -119,7 +145,12 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
      * @returns - RemoteSerialClientPortInstance
      */
     create_port(path: string, opt?: CreatePortOptions | undefined): RemoteSerialClientPortInstance {
+        if (this._remoteSerialClientPortInstance_map.has(path) === true) {
+            return this._remoteSerialClientPortInstance_map.get(path) as RemoteSerialClientPortInstance;
+        }
         MockBinding.createPort(path, opt);
-        return new RemoteSerialClientPortInstance(MockBinding, path);
+        const remote_serial_client_port_instance = new RemoteSerialClientPortInstance(MockBinding, path);
+        this._remoteSerialClientPortInstance_map.set(path, remote_serial_client_port_instance);
+        return remote_serial_client_port_instance;
     }
 }
