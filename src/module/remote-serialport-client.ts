@@ -18,6 +18,8 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
 
     protected _open_options: OpenSerialPortOptions;
 
+    private _debug_mode: boolean = false;
+
     constructor(socket: Socket, open_options: OpenSerialPortOptions) {
         super();
         this._socket = socket;
@@ -34,7 +36,15 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
             }
         });
         this.once("serialport_init_result", (data) => {
-            console.log(data);
+            if (data.code === "serialport_init_result" && data.data === true) {
+                if (this._debug_mode === true) {
+                    console.log("Serialport Init Result: ", data);
+                }
+            } else if (data.code === "serialport_init_result" && data.data === false) {
+                throw new Error("Serialport Init Failed");
+            } else {
+                throw new Error("Invalid Serialport Init Result");
+            }
         });
     }
 
