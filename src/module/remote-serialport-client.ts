@@ -21,6 +21,9 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
     constructor(socket: Socket, open_options: OpenSerialPortOptions) {
         super();
         this._socket = socket;
+        if (open_options === undefined || open_options === null) {
+            throw new Error("Invalid Open Options");
+        }
         this._open_options = open_options;
         this.once("serialport_handshake", (data) => {
             if (data.code === "handshake" && data.data === true) {

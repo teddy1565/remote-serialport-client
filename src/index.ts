@@ -26,6 +26,9 @@ export class RemoteSerialportClient extends AbsRemoteSerialportClient {
         if (namesapce.match(this.serialport_check_regexp) === null) {
             throw new Error("Invalid Serialport");
         }
+        if (open_options === undefined || open_options === null) {
+            throw new Error("Invalid Open Options");
+        }
         const socketIO_client_instance = this.client_manager.socket(namesapce);
         this._socket = new RemoteSerialClientSocket(socketIO_client_instance, open_options);
         return this._socket;
