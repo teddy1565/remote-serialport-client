@@ -60,4 +60,27 @@ This Project is divided into three parts:
 
 ### Client
 
-Not Implemented Yet, Wait Server Implementation.
+```javascript
+const { RemoteSerialportClient } = require("node-serialport-client");
+const { ByteLengthParser } = require("serialport");
+
+const RSC = new RemoteSerialportClient("ws://localhost:17991"); // Initialize the client with the server address
+
+// In windows
+const client = RSC.connect("/COM5", { baudRate: 115200 }); // Connect to the server and get the port
+
+// In linux
+const client_linux = RSC.connect("/dev/ttyUSB0", { baudRate: 115200 }); // Connect to the server and get the port
+
+// Mapping remote port COM5 to local port COM17
+const serialport = client.create_port("COM17").get_port({
+    baudRate: 115200,
+    autoOpen: true
+});
+
+const parser = serialport.pipe(new ByteLengthParser({ length: 30 }));
+
+parser.on("data", (data) => {
+    console.log(data);
+});
+```
