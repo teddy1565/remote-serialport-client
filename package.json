@@ -1,11 +1,24 @@
 {
-    "name": "remote-serialport-client",
-    "version": "1.0.0",
-    "description": "",
-    "main": "index.js",
+    "name": "node-serialport-client",
+    "version": "0.0.4",
+    "description": "Remote Serialport Client",
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "files": [
+        "dist"
+    ],
     "scripts": {
-        "test": "echo \"Error: no test specified\" && exit 1"
+        "test": "tsc --project tsconfig-test.json && cd ./dist-test/test && node ./index.js",
+        "start": "npm run test",
+        "build-test": "tsc --project tsconfig-test.json",
+        "build-prod": "tsc --project tsconfig.json",
+        "build": "npm run build-prod"
     },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/teddy1565/remote-serialport-client.git"
+    },
+    "homepage": "https://github.com/teddy1565/remote-serialport-client",
     "author": "teddy1565",
     "license": "MIT",
     "devDependencies": {
