@@ -60,6 +60,8 @@ This Project is divided into three parts:
 
 ### Client
 
+#### Usual Usage
+
 ```javascript
 const { RemoteSerialportClient } = require("node-serialport-client");
 const { ByteLengthParser } = require("serialport");
@@ -83,4 +85,44 @@ const parser = serialport.pipe(new ByteLengthParser({ length: 30 }));
 parser.on("data", (data) => {
     console.log(data);
 });
+```
+
+#### With Modbus-Serial
+
+```javascript
+const { RemoteSerialportClient } = require("node-serialport-client");;
+const ModbusRTU = require("modbus-serial");
+
+const RSC = new RemoteSerialportClient("ws://localhost:17991"); // Initialize the client with the server address
+
+// In windows
+const client = RSC.connect("/COM5", { baudRate: 115200 }); // Connect to the server and get the port
+
+// In linux
+const client_linux = RSC.connect("/dev/ttyUSB0", { baudRate: 115200 }); // Connect to the server and get the port
+
+// Mapping remote port COM5 to local port COM17
+const port = client.create_port("COM17");
+
+// There has two ways to create a modbus client
+
+// first way
+// create an empty modbus client
+const client = new ModbusRTU();
+// open connection to a serial port
+client.connectRTUBuffered("/dev/ttyUSB0", { baudRate: 9600 });
+
+
+// or you can use the second way
+
+// the second way
+const client = new ModbusMaster(port.get_port({ baudRate: 9600 }));
+
+client.setID(1)
+client.readHoldingRegisters(3, 2).then((data) => {
+    console.log(data)
+}).catch((error) => {
+    console.log(error)
+})
+
 ```
