@@ -8,9 +8,40 @@ import { SocketServerSideEmitChannel,
     SocketClientSideEmitPayload } from "../types/remote-serialport-types/src/index";
 
 import { OpenSerialPortOptions } from "../types/remote-serialport-types/src/serialport";
-import { AbsRemoteSerialportClientSocket } from "../types/remote-serialport-types/src/remote-serial-client.model";
+import { AbsRemoteSerialportClientPortInstance, AbsRemoteSerialportClientSocket, OpenOptoinsForSerialPortStream } from "../types/remote-serialport-types/src/remote-serial-client.model";
+import { MockBindingInterface, CreatePortOptions, MockBinding } from "@serialport/binding-mock";
+import { SerialPortStream, OpenOptions } from "@serialport/stream";
+import { BindingInterface } from "@serialport/bindings-interface";
 
+export class RemoteSerialClientPortInstance extends AbsRemoteSerialportClientPortInstance {
+    protected mock_binding: MockBindingInterface;
 
+    protected port_path: string;
+    /**
+     * @param mock_binding - Mock Binding Instance
+     * @param port_path - Serial Port Path
+     * @param open_options - Open SerialPortStream Options
+     */
+    constructor(mock_binding: MockBindingInterface, port_path: string) {
+        super();
+        this.mock_binding = mock_binding;
+        this.port_path = port_path;
+    }
+
+    /**
+     * get a serial port stream instance
+     * @param open_options - Open SerialPortStream Options
+     * @returns SerialPortStream Instance
+     */
+    public get_port(open_options: OpenOptoinsForSerialPortStream): SerialPortStream {
+        if (open_options === undefined || open_options === null) {
+            throw new Error("Invalid Open Options");
+        }
+        open_options.binding = this.mock_binding;
+        open_options.path = this.port_path;
+        return new SerialPortStream(open_options as OpenOptions<BindingInterface>);
+    }
+}
 
 
 export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
@@ -70,5 +101,25 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
 
     disconnect(close?: boolean): void {
         this._socket.disconnect();
+    }
+
+    /**
+     * @description
+     * Create a virtual serial port
+     * @example
+     * const remote_serialport_client = new RemoteSerialportClient("ws://localhost:17991");
+     * const serialport_client = remote_serialport_client.connect("/dev/ttyUSB0", { // speicify remote serial port path
+     *    path: "/dev/ttyUSB0",
+     *    baudRate: 115200
+     * });
+     *
+     * serialport_client.create_port("/dev/ttyUSB1", { echo: true, record: true }).get_port({ })
+     * @param path - Serial Port Path
+     * @param opt - Create Port Options
+     * @returns - RemoteSerialClientPortInstance
+     */
+    create_port(path: string, opt?: CreatePortOptions | undefined): RemoteSerialClientPortInstance {
+        MockBinding.createPort(path, opt);
+        return new RemoteSerialClientPortInstance(MockBinding, path);
     }
 }
