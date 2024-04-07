@@ -6,41 +6,42 @@ This is a repository for remote proxying of serial ports.
 
 It is a simple server-client architecture where the server is connected to the serial port and the client connects to the server to read and write to the serial port.
 
-This Project is divided into three parts:
+And then, when the client connects to the server, the server will create a virtual serial port on the client side, and the client can read and write to the virtual serial port.
 
-1. Server
+the operation will sync to the server and the server will read and write to the physical serial port.
+
+This Project is divided into two parts:
+
+1. [Remote-Serialport-Server](https://www.npmjs.com/package/node-serialport-server)
    - Control Host Physical Serial Port, and virtualize it to the network or IPC.
      - Milestone
        - [ ] Web Socket
        - [ ] Nodejs IPC
        - [ ] Electron utility IPC
-2. Client
+2. [Remote-Serialport-Client](https://www.npmjs.com/package/node-serialport-client)
    - Connect to the server and read and write to the serial port.
      - Milestone
        - [ ] Web Socket
        - [ ] Nodejs IPC
        - [ ] Electron utility IPC
-3. Types
-   - Common types used in both server and client.
+
+### Why Remote-Serialport
+
+You can also make one yourself
+But some people have done it, why not just use the kit?
+
+### A little bit of history
+
+In the future, maybe we will merge client and server repo into one repo.
 
 ## Features
 
 - [ ] Remote Serial Port Protocol ▶
-  - [ ] Web Socket  ▶
+  - [x] Web Socket  ▶
     - [x] Connect To Socket Server
     - [x] Socket NameSpace Parser for Serial Port
-  - [ ] Inter Process Communication  ○
-- [ ] Read from serial port ▶
-  - [ ] Read With Parser
-    - [ ] ByteLengthParser
-    - [ ] CCTalkParser
-    - [ ] InterByteTimeoutParser
-    - [ ] PacketLengthParser
-    - [ ] ReadlineParser
-    - [ ] ReadyParser
-    - [ ] RegexParser
-    - [ ] SlipEncoder
-    - [ ] SpacePacketParser
+  - [ ] Inter Process Communication (In planning)
+- [x] Read from serial port ▶
 - [ ] Write to serial port
   - [ ] Web Socket
     - [ ] Write to Serial Port
@@ -55,8 +56,40 @@ This Project is divided into three parts:
       - [ ] Message Encryption
       - [ ] Memory Protection
       - [ ] Message Authentication
+    - [ ] Architecture
+      - [ ] Copy-On-Write Architecture
+      - [ ] Multi-Access Architecture
   
 ## Usage
+
+### Server
+
+```javascript
+
+const { RemoteSerialportServer } = require("node-serialport-server");
+
+const server_options = {
+    cors: {
+        allowedHeaders: ["*"],
+        origin: "*",
+        methods: ["GET", "POST", "PUT", "DELETE"]
+    }
+};
+
+const server = new RemoteSerialportServer(server_options, 17991);
+server.listen();
+
+server.of().on("connection", (socket) => {
+    socket.port.on("data", (data) => {
+        // You can transfer before sending the data
+        socket.emit("serialport_packet", data); // Send the data to the client
+    });
+});
+
+
+```
+
+---
 
 ### Client
 
