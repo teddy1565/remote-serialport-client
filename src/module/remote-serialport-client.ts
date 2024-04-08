@@ -92,6 +92,9 @@ export class RemoteSerialClientPortInstance extends AbsRemoteSerialportClientPor
 
     private _serialport_stream: RemoteSerialportStream | null = null;
 
+    /**
+     * Serialport Data I/O interface Event Emitter
+     */
     private _data_event_emitter: RemoteSerialClientPortInstanceEventEmitter;
 
     /**
@@ -140,8 +143,20 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
 
     private _remoteSerialClientPortInstance_map: Map<string, RemoteSerialClientPortInstance> = new Map();
 
+    /**
+     * Serialport Data I/O interface Event Emitter
+     */
     private _data_event_emitter: RemoteSerialClientPortInstanceEventEmitter  = new RemoteSerialClientPortInstanceEventEmitter();
 
+    /**
+     * When WebSocket handshake is successful, it will be `true`. Otherwise, it will be `false`.
+     */
+    private _remote_serialport_init_status: boolean = false;
+
+    /**
+     * @param socket - Socket.io Socket Instance
+     * @param open_options - serialport open options
+     */
     constructor(socket: Socket, open_options: OpenSerialPortOptions) {
         super();
         this._socket = socket;
@@ -162,6 +177,7 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
                 if (this._debug_mode === true) {
                     console.log("Serialport Init Result: ", data);
                 }
+                this._remote_serialport_init_status = true;
                 this.on("serialport_packet", (data_chunk) => {
                     for(const [path, remote_serial_client_port_instance] of this._remoteSerialClientPortInstance_map) {
                         remote_serial_client_port_instance.write(data_chunk as Buffer);
@@ -177,6 +193,14 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
         this._data_event_emitter.on("write-command", (data) => {
             this.emit("serialport_send_packet", data);
         });
+    }
+
+    /**
+     * @description
+     * Get Remote Serialport Init Status
+     */
+    get remote_serialport_init_status(): boolean {
+        return this._remote_serialport_init_status;
     }
 
     emit(channel: Extract<SocketClientSideEmitChannel, "serialport_send_packet">, message: SocketClientSideEmitPayload_SerialPort_SendPacket): void;
@@ -195,6 +219,11 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
 
     once(channel: "serialport_handshake", listener: (data: SocketServerSideEmitPayload & SocketServerSideEmitPayload_RemoteSerialServerHandshake) => void): void;
     once(channel: "serialport_packet", listener: (data_chunk: SocketServerSideEmitPayload & SocketServerSideEmitPayload_SerialPort_Packet) => void): void;
+    /**
+     * When WebSocket handshake done, toggle the serialport handshake event
+     * @param channel
+     * @param listener
+     */
     once(channel: "serialport_init_result", listener: (data: SocketServerSideEmitPayload & SocketServerSideEmitPayload_SerialPort_InitResult) => void): void;
     once(channel: SocketServerSideEmitChannel, listener: (data: SocketServerSideEmitPayload) => void): void;
     once(channel: SocketServerSideEmitChannel, listener: (...args: any[]) => void): void {
