@@ -5,6 +5,7 @@ import { SocketServerSideEmitChannel,
     SocketServerSideEmitPayload_SerialPort_Packet,
     SocketServerSideEmitPayload_RemoteSerialServerHandshake,
     SocketServerSideEmitPayload_SerialPort_InitResult,
+    SocketClientSideEmitPayload_SerialPort_SendPacket,
     SocketClientSideEmitPayload } from "../types/remote-serialport-types/src/index";
 
 import { OpenSerialPortOptions } from "../types/remote-serialport-types/src/serialport";
@@ -15,29 +16,94 @@ import { BindingInterface } from "@serialport/bindings-interface";
 
 import EventEmitter from "events";
 
+export class RemoteSerialClientPortInstanceEventEmitter extends EventEmitter {
+    constructor() {
+        super();
+    }
+
+    emit(channel: "write-command", data: Buffer | Array<number>): boolean {
+        return super.emit(channel, data);
+    }
+
+    on(channel: "write-command", listener: (data: Buffer | Array<number>) => void): this {
+        return super.on(channel, listener);
+    }
+
+    once(channel: "write-command", listener: (data: Buffer | Array<number>) => void): this {
+        return super.once(channel, listener);
+    }
+}
+
+export class RemoteSerialportStream extends SerialPortStream {
+
+    private _portInstanceEventEmitter: RemoteSerialClientPortInstanceEventEmitter;
+
+    constructor(options: OpenOptions, portInstanceEventEmitter: RemoteSerialClientPortInstanceEventEmitter) {
+        super(options);
+        this._portInstanceEventEmitter = portInstanceEventEmitter;
+    }
+
+    /**
+     * When logical data is written to the local port, it will be encapsulated and sent to the remote end.
+     * @param chunk
+     * @param encoding
+     * @param cb
+     */
+    // eslint-disable-next-line no-undef
+    override write(chunk: Buffer | Array<number>, encoding?: BufferEncoding, cb?: (error: Error | null | undefined) => void): boolean;
+    /**
+     * When logical data is written to the local port, it will be encapsulated and sent to the remote end.
+     * @param chunk
+     * @param encoding
+     * @param cb
+     */
+    override write(chunk: Buffer | Array<number>, cb?: (error: Error | null | undefined) => void): boolean;
+    override write(chunk: Buffer | Array<number>, encoding?: any, cb?: any): boolean {
+        this._portInstanceEventEmitter.emit("write-command", chunk);
+        return true;
+    }
+
+    /**
+     * When physical data is written from the remote end, through additional encapsulation, writing to the local logical port will not conflict with the logical port reading packets.
+     *
+     * for example, when remote side get <buffer aa bb cc dd>, but local side write <buffer ee ff>
+     *
+     * you will get <buffer aa bb cc dd ee ff> when you read from the local side
+     *
+     * so, we need split the buffer to two parts, one is <buffer aa bb cc dd>, another is <buffer ee ff>
+     *
+     * when we get remote packet, use this method write to the local logical port,
+     *
+     * when we write to the local logical port, use other overridemethod `write` to the remote end
+     * @param chunk
+     * @returns
+     */
+    write_from_physical_remote_write(chunk: Buffer | Array<number>): boolean {
+        return super.write(chunk);
+    }
+}
+
+
+
 export class RemoteSerialClientPortInstance extends AbsRemoteSerialportClientPortInstance {
     protected mock_binding: MockBindingInterface;
 
     protected port_path: string;
 
-    private _serialport_stream: SerialPortStream | null = null;
+    private _serialport_stream: RemoteSerialportStream | null = null;
 
-    private _data_event_emitter: EventEmitter = new EventEmitter();
+    private _data_event_emitter: RemoteSerialClientPortInstanceEventEmitter;
 
     /**
      * @param mock_binding - Mock Binding Instance
      * @param port_path - Serial Port Path
      * @param open_options - Open SerialPortStream Options
      */
-    constructor(mock_binding: MockBindingInterface, port_path: string) {
+    constructor(mock_binding: MockBindingInterface, port_path: string, data_event_emitter: RemoteSerialClientPortInstanceEventEmitter) {
         super();
         this.mock_binding = mock_binding;
         this.port_path = port_path;
-        this._data_event_emitter.on("data", (data_chunk: Buffer | Array<number>) => {
-            if (this._serialport_stream !== null) {
-                this._serialport_stream.write(data_chunk);
-            }
-        });
+        this._data_event_emitter = data_event_emitter;
     }
 
     /**
@@ -45,7 +111,7 @@ export class RemoteSerialClientPortInstance extends AbsRemoteSerialportClientPor
      * @param open_options - Open SerialPortStream Options
      * @returns SerialPortStream Instance
      */
-    public get_port(open_options: OpenOptoinsForSerialPortStream): SerialPortStream {
+    public get_port(open_options: OpenOptoinsForSerialPortStream): RemoteSerialportStream {
         if (open_options === undefined || open_options === null) {
             throw new Error("Invalid Open Options");
         } else if (this._serialport_stream !== null) {
@@ -53,12 +119,14 @@ export class RemoteSerialClientPortInstance extends AbsRemoteSerialportClientPor
         }
         open_options.binding = this.mock_binding;
         open_options.path = this.port_path;
-        this._serialport_stream = new SerialPortStream(open_options as OpenOptions<BindingInterface>);
+        this._serialport_stream = new RemoteSerialportStream(open_options as OpenOptions<BindingInterface>, this._data_event_emitter);
         return this._serialport_stream;
     }
 
     public write(data: Buffer): void {
-        this._data_event_emitter.emit("data", data);
+        if (this._serialport_stream !== null) {
+            this._serialport_stream.write_from_physical_remote_write(data);
+        }
     }
 }
 
@@ -71,6 +139,8 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
     private _debug_mode: boolean = false;
 
     private _remoteSerialClientPortInstance_map: Map<string, RemoteSerialClientPortInstance> = new Map();
+
+    private _data_event_emitter: RemoteSerialClientPortInstanceEventEmitter  = new RemoteSerialClientPortInstanceEventEmitter();
 
     constructor(socket: Socket, open_options: OpenSerialPortOptions) {
         super();
@@ -103,8 +173,14 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
                 throw new Error("Invalid Serialport Init Result");
             }
         });
+
+        this._data_event_emitter.on("write-command", (data) => {
+            this.emit("serialport_send_packet", data);
+        });
     }
 
+    emit(channel: Extract<SocketClientSideEmitChannel, "serialport_send_packet">, message: SocketClientSideEmitPayload_SerialPort_SendPacket): void;
+    emit(channel: SocketClientSideEmitChannel, message: SocketClientSideEmitPayload): void;
     emit(channel: SocketClientSideEmitChannel, message: SocketClientSideEmitPayload): void {
         this._socket.emit(channel, message);
     }
@@ -149,7 +225,7 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
             return this._remoteSerialClientPortInstance_map.get(path) as RemoteSerialClientPortInstance;
         }
         MockBinding.createPort(path, opt);
-        const remote_serial_client_port_instance = new RemoteSerialClientPortInstance(MockBinding, path);
+        const remote_serial_client_port_instance = new RemoteSerialClientPortInstance(MockBinding, path, this._data_event_emitter);
         this._remoteSerialClientPortInstance_map.set(path, remote_serial_client_port_instance);
         return remote_serial_client_port_instance;
     }
