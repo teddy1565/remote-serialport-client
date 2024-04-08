@@ -224,6 +224,11 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
         if (this._remoteSerialClientPortInstance_map.has(path) === true) {
             return this._remoteSerialClientPortInstance_map.get(path) as RemoteSerialClientPortInstance;
         }
+
+        if (opt === undefined || opt === null) {
+            opt = <CreatePortOptions>{ echo: true };
+        }
+        opt.echo = true; // echo must be `true`, because need get buffer data from mock binding
         MockBinding.createPort(path, opt);
         const remote_serial_client_port_instance = new RemoteSerialClientPortInstance(MockBinding, path, this._data_event_emitter);
         this._remoteSerialClientPortInstance_map.set(path, remote_serial_client_port_instance);
