@@ -60,13 +60,7 @@ export class RemoteSerialportStream extends SerialPortStream {
     override write(chunk: Buffer | Array<number>, cb?: (error: Error | null | undefined) => void): boolean;
     override write(chunk: Buffer | Array<number>, encoding?: any, cb?: any): boolean {
         this._portInstanceEventEmitter.emit("write-command", chunk);
-
-        // Not sure original serialport will write echo data or not, so current implementation is not sure
-        // 我不確定原本的serialport是否會將寫入的buffer資料時，在on("data")中是否會收到echo的資料，所以這邊的實作不確定，需要測試，目前先保留echo狀態
-        if (cb !== undefined) {
-            return super.write(chunk, encoding, cb);
-        }
-        return super.write(chunk, encoding);
+        return true;
     }
 
     /**
