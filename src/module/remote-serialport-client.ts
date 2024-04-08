@@ -139,7 +139,7 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
 
     protected _open_options: OpenSerialPortOptions;
 
-    private _debug_mode: boolean = false;
+    private _debug_mode: boolean;
 
     private _remoteSerialClientPortInstance_map: Map<string, RemoteSerialClientPortInstance> = new Map();
 
@@ -156,14 +156,51 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
     /**
      * @param socket - Socket.io Socket Instance
      * @param open_options - serialport open options
+     * @param debug_mode - Debug Mode
      */
-    constructor(socket: Socket, open_options: OpenSerialPortOptions) {
+    constructor(socket: Socket, open_options: OpenSerialPortOptions, debug_mode: boolean = false) {
         super();
-        this._socket = socket;
         if (open_options === undefined || open_options === null) {
             throw new Error("Invalid Open Options");
         }
+        this._socket = socket;
+        this._debug_mode = debug_mode;
+
+        this._socket.on("connect", () => {
+            this._initialize();
+        });
         this._open_options = open_options;
+
+        /**
+         * When the server-side sends a packet, it will be sent to the local serial port
+         */
+        this.on("serialport_packet", (data_chunk) => {
+            for(const [path, remote_serial_client_port_instance] of this._remoteSerialClientPortInstance_map) {
+                remote_serial_client_port_instance.write(data_chunk as Buffer);
+            }
+        });
+
+        /**
+         * when local serialport call `write` method, it will be sent to this event emitter, and then send to the server-side
+         */
+        this._data_event_emitter.on("write-command", (data) => {
+            this.emit("serialport_send_packet", data);
+        });
+    }
+
+    /**
+     * @description
+     * Get Remote Serialport Init Status
+     */
+    get remote_serialport_init_status(): boolean {
+        return this._remote_serialport_init_status;
+    }
+
+    /**
+     * @description
+     * Initialize Remote Serialport Client (Init Socket Handshake)
+     */
+    private _initialize(): void {
         this.once("serialport_handshake", (data) => {
             if (data.code === "handshake" && data.data === true) {
                 this.emit("serialport_handshake", {
@@ -178,29 +215,14 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
                     console.log("Serialport Init Result: ", data);
                 }
                 this._remote_serialport_init_status = true;
-                this.on("serialport_packet", (data_chunk) => {
-                    for(const [path, remote_serial_client_port_instance] of this._remoteSerialClientPortInstance_map) {
-                        remote_serial_client_port_instance.write(data_chunk as Buffer);
-                    }
-                });
             } else if (data.code === "serialport_init_result" && data.data === false) {
+                this._remote_serialport_init_status = false;
                 throw new Error("Serialport Init Failed");
             } else {
+                this._remote_serialport_init_status = false;
                 throw new Error("Invalid Serialport Init Result");
             }
         });
-
-        this._data_event_emitter.on("write-command", (data) => {
-            this.emit("serialport_send_packet", data);
-        });
-    }
-
-    /**
-     * @description
-     * Get Remote Serialport Init Status
-     */
-    get remote_serialport_init_status(): boolean {
-        return this._remote_serialport_init_status;
     }
 
     emit(channel: Extract<SocketClientSideEmitChannel, "serialport_send_packet">, message: SocketClientSideEmitPayload_SerialPort_SendPacket): void;
