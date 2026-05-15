@@ -166,4 +166,10 @@ export class RemoteSerialportClient extends AbsRemoteSerialportClient {
 /* ---- transport re-exports ---- */
 export { SocketIoClient, SocketIoClientTransport } from "./module/socketio-transport";
 export { NodeIpcClient, NodeIpcClientTransport, MessagePortLike } from "./module/ipc-transport";
+export { RawTcpClient, RawTcpConnectTarget, RawTcpClientOptions } from "./module/raw-tcp-transport";
+export { RawWebSocketClient, RawWebSocketConnectTarget, RawWebSocketClientOptions } from "./module/raw-websocket-transport";
+export { Http2Client, Http2ConnectTarget, Http2ClientOptions } from "./module/http2-transport";
+export { MqttRsClient, MqttClientOptions } from "./module/mqtt-transport";
+export { GrpcClient, GrpcConnectTarget, GrpcClientOptions } from "./module/grpc-transport";
+export { WebRtcClient, WebRtcClientOptions, WebRtcSignalingChannel, WebRtcSignalingMessage } from "./module/webrtc-transport";
 export type { AbsTransport, AbsTransportClient } from "./types/remote-serialport-types/src/transport";

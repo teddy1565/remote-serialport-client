@@ -374,6 +374,224 @@ socket.io:
 | Endpoint multiplexing | one per `connect(label)` / `mux(label)` | single endpoint per IPC pair; **use mux mode** |
 | Connection model | many clients → server | one peer pair |
 
+#### Raw TCP / Unix Domain Socket / Named Pipe (`RawTcpClient`)
+
+A length-prefix-framed JSON envelope transport over `net.Socket` (mirror of the server-side
+`RawTcpServer`). Same `mode` selector, same TCP vs UDS / Pipe choice via `host+port` vs `path`.
+
+```javascript
+const { RemoteSerialportClient, RawTcpClient } = require("node-serialport-client");
+
+// Plain TCP, mux mode (default)
+new RemoteSerialportClient("", {
+    transport_client: new RawTcpClient({ host: "localhost", port: 17993 })
+});
+
+// TLS over TCP (self-signed cert? pass `{rejectUnauthorized:false}` or the CA you generated)
+new RawTcpClient({ host: "remote", port: 17994 }, {
+    tls: { ca: ca_cert, servername: "remote" }   // production
+});
+new RawTcpClient({ host: "localhost", port: 17994 }, {
+    tls: { rejectUnauthorized: false }            // local dev with self-signed cert
+});
+
+// 1-to-1 (one connection per namespace)
+new RawTcpClient({ host: "localhost", port: 17995 }, { mode: "single-namespace" });
+
+// UDS / Named Pipe
+new RawTcpClient({ path: "/tmp/rsp.sock" });
+new RawTcpClient({ path: "\\\\.\\pipe\\rsp" });
+```
+
+`RawTcpClientOptions`:
+
+| Option | Default | What it does |
+|---|---|---|
+| `mode` | `"mux"` | Must match the server's mode (otherwise the hello envelope doesn't route as expected). |
+| `tls` | — | `tls.ConnectionOptions`. Pass `{}` to enable TLS with system CA + verify; pass `{ ca, servername }` for a private CA; `{ rejectUnauthorized: false }` for local self-signed cert. Ignored for `path:` targets. |
+| `keep_alive` | `true` (30 s) | TCP keepalive. |
+| `auth` | — | Credential forwarded in the `hello` envelope to `auth_validator`. |
+| `logger` | default | Inject your `Logger`. |
+
+For full transport behaviour matrix (reconnect / backpressure / TLS / etc.) see the
+[server README](../remote-serialport-server/README.md#raw-tcp--unix-domain-socket--named-pipe-rawtcpserver).
+
+#### Raw WebSocket (`RawWebSocketClient`)
+
+WebSocket-based transport using the `ws` library. Mirror of the server-side `RawWebSocketServer`.
+Same `mode` selector; URL form for connect target. `ws://` for plain, `wss://` for TLS.
+
+```javascript
+const { RemoteSerialportClient, RawWebSocketClient } = require("node-serialport-client");
+
+// Plain ws, mux mode (default)
+new RemoteSerialportClient("", {
+    transport_client: new RawWebSocketClient({ url: "ws://localhost:17996" })
+});
+
+// TLS (wss)
+new RawWebSocketClient({ url: "wss://remote:17997" }, {
+    tls: { ca: ca_cert, servername: "remote" }    // production private CA
+});
+new RawWebSocketClient({ url: "wss://localhost:17997" }, {
+    tls: { rejectUnauthorized: false }            // local dev self-signed
+});
+
+// 1-to-1
+new RawWebSocketClient({ url: "ws://localhost:17998" }, { mode: "single-namespace" });
+```
+
+`RawWebSocketClientOptions`:
+
+| Option | Default | What it does |
+|---|---|---|
+| `mode` | `"mux"` | Must match the server's mode. |
+| `tls` | — | Forwarded to the `ws` constructor's options object — supports `ca`, `cert`, `key`, `passphrase`, `rejectUnauthorized`, `servername`, etc. Only effective when `url` is `wss://`. |
+| `auth` | — | Credential forwarded in the `hello` envelope. |
+| `logger` | default | Inject your `Logger`. |
+
+Compared to socket.io, `RawWebSocketClient` skips Engine.IO's polling fallback and gives slightly higher binary throughput (~44 MB/s localhost vs socket.io's ~18 MB/s on the same hardware). Use socket.io when you need Engine.IO's reconnect / auto-fallback semantics; use Raw WebSocket when you want a tighter TCP-only path.
+
+#### HTTP/2 (`Http2Client`)
+
+Uses Node's built-in `node:http2`. Each `open(label)` opens a new HTTP/2 stream with `:path: label`
+within a single shared session, taking advantage of per-stream flow control (no head-of-line
+blocking between namespaces).
+
+```javascript
+const { RemoteSerialportClient, Http2Client } = require("node-serialport-client");
+
+// h2 over TLS
+new RemoteSerialportClient("", {
+    transport_client: new Http2Client(
+        { url: "https://remote:17996" },
+        { tls: { ca: ca_cert, servername: "remote" } }
+    )
+});
+
+// h2c cleartext (trusted internal networks)
+new Http2Client({ url: "http://localhost:17997" });
+```
+
+`Http2ClientOptions`:
+
+| Option | Default | What it does |
+|---|---|---|
+| `tls` | — | `http2.SecureClientSessionOptions` forwarded to `http2.connect`. Use for self-signed dev (`{ rejectUnauthorized: false }`) or production private CA (`{ ca, servername }`). Only effective for `https://` URLs. |
+| `h2_options` | — | Extra h2 session options (settings, peer max concurrent streams, etc.). |
+| `auth` | — | Credential forwarded in the per-stream `hello` envelope. |
+| `logger` | default | Inject your `Logger`. |
+
+HTTP/2 gives the best p99 latency (1.48 ms locally) thanks to per-stream flow control; throughput is between Raw TCP and socket.io (~17 MB/s).
+
+#### MQTT broker pattern (`MqttRsClient`)
+
+Talks to an MQTT broker; publishes on per-client/per-namespace c2s topics and subscribes to the
+matching s2c topics. Mirror of `MqttServer`. Exported as `MqttRsClient` (the `mqtt` library
+already exports a class named `MqttClient`, so we use the `Rs` prefix to avoid a collision).
+
+```javascript
+const { RemoteSerialportClient, MqttRsClient } = require("node-serialport-client");
+
+new RemoteSerialportClient("", {
+    transport_client: new MqttRsClient({
+        broker_url: "mqtt://broker.internal:1883",
+        topic_prefix: "rsp",
+        qos: 1,
+        auth: { token: "..." },
+        mqtt_options: { username: "u", password: "p" }
+    })
+});
+```
+
+`MqttClientOptions`:
+
+| Option | Default | What it does |
+|---|---|---|
+| `broker_url` | (required) | Same URL as the server side. |
+| `topic_prefix` | `"rsp"` | Must match the server's prefix. |
+| `client_id` | random UUID | Used in the MQTT clientId and in the c2s/s2c topic path. |
+| `qos` | `1` | MQTT QoS. Use 1 or 2; never 0 for serial streams. |
+| `mqtt_options` | — | Forwarded to `mqtt.connect`. |
+| `auth` | — | Credential forwarded in the `hello` envelope. |
+| `logger` | default | Inject your `Logger`. |
+
+The MQTT pattern fits "decoupled deployment" scenarios where server and clients only know the
+broker's address and the broker can survive network blips on either side. Don't use it when you
+need the lowest possible latency — at-source-broker round-trips push p99 well above the direct
+transports.
+
+#### gRPC (`GrpcClient`)
+
+Wraps `@grpc/grpc-js`. Each `open(label)` opens a new bi-directional `Channel` streaming RPC
+with metadata `rsp-label: <label>` and (optionally) `rsp-auth: <JSON>`. Mirror of `GrpcServer`.
+
+```javascript
+const { RemoteSerialportClient, GrpcClient } = require("node-serialport-client");
+const grpc = require("@grpc/grpc-js");
+
+// Insecure
+new RemoteSerialportClient("", {
+    transport_client: new GrpcClient({ address: "localhost:17996" })
+});
+
+// TLS
+const tls_creds = grpc.credentials.createSsl(fs.readFileSync("ca.crt"));
+new GrpcClient(
+    { address: "remote:17997" },
+    {
+        credentials: tls_creds,
+        channel_options: { "grpc.ssl_target_name_override": "remote" }
+    }
+);
+```
+
+`GrpcClientOptions`:
+
+| Option | Default | What it does |
+|---|---|---|
+| `credentials` | `grpc.credentials.createInsecure()` | Standard `ChannelCredentials`. |
+| `channel_options` | — | Per-channel options (`grpc.ssl_target_name_override`, `grpc.max_receive_message_length`, etc.). |
+| `auth` | — | Sent as `rsp-auth` metadata (JSON-encoded) on every stream open. |
+| `logger` | default | Inject your `Logger`. |
+
+The `.proto` is shipped in the client package under `proto/remote-serialport.proto` and loaded
+on first `open()`.
+
+#### WebRTC DataChannel (`WebRtcClient`) — experimental
+
+True P2P transport. Each `open(label)` creates a new DataChannel on the peer connection.
+Bring-your-own signaling. Mirror of `WebRtcServer`.
+
+```javascript
+const { RemoteSerialportClient, WebRtcClient } = require("node-serialport-client");
+
+const signaling = {
+    on_message(handler) { /* receive offers/answers/candidates from server side */ },
+    send(msg) { /* forward to server */ }
+};
+
+new RemoteSerialportClient("", {
+    transport_client: new WebRtcClient({
+        signaling,
+        ice_servers: ["stun:stun.l.google.com:19302"]
+    })
+});
+```
+
+`WebRtcClientOptions`:
+
+| Option | Default | What it does |
+|---|---|---|
+| `signaling` | (required) | `WebRtcSignalingChannel` adapter; see server README for shape. |
+| `ice_servers` | `["stun:stun.l.google.com:19302"]` | String array; node-datachannel doesn't take W3C objects. |
+| `peer_id` | random UUID | Stable id for this peer, carried in every signaling message. |
+| `logger` | default | Inject your `Logger`. |
+
+The library bundles `node-datachannel` (native dep, libdatachannel + libsrtp + libjuice). The
+walkthrough's [webrtc-smoke.js](../note/walkthrough/webrtc-smoke.js) uses an in-process
+EventEmitter for signaling so you can try it without a real signaling server.
+
 ## Protocol (v2)
 
 `serialport_handshake` (S→C) announces the protocol version on connect; the client checks
@@ -591,6 +809,209 @@ const stream = mux.create_port("/dev/ttyACM0", "/dev/ttyV0").get_port({ baudRate
 | Wire backpressure | 採樣 `bufferedAmount` | 回 `null`，跳過 |
 | Endpoint 多工 | 每 `connect(label)` / `mux(label)` 一個 | 單 endpoint per IPC pair；**用 mux mode** |
 | Connection model | 多 client → server | 1-to-1 process pair |
+
+#### Raw TCP / Unix Domain Socket / Named Pipe（`RawTcpClient`）
+
+長度前綴 framing + JSON envelope，跑在 `net.Socket` 上（server 端 `RawTcpServer` 的對應）。同樣的 `mode` 選項，同樣用 `host+port` 或 `path` 區分 TCP / UDS / Named Pipe。
+
+```javascript
+const { RemoteSerialportClient, RawTcpClient } = require("node-serialport-client");
+
+// Plain TCP，mux 模式（預設）
+new RemoteSerialportClient("", {
+    transport_client: new RawTcpClient({ host: "localhost", port: 17993 })
+});
+
+// TLS over TCP（自簽 cert 開發用 rejectUnauthorized:false；production 傳 ca + servername）
+new RawTcpClient({ host: "remote", port: 17994 }, {
+    tls: { ca: ca_cert, servername: "remote" }   // production
+});
+new RawTcpClient({ host: "localhost", port: 17994 }, {
+    tls: { rejectUnauthorized: false }            // 本地自簽 cert 開發用
+});
+
+// 1-to-1
+new RawTcpClient({ host: "localhost", port: 17995 }, { mode: "single-namespace" });
+
+// UDS / Named Pipe
+new RawTcpClient({ path: "/tmp/rsp.sock" });
+new RawTcpClient({ path: "\\\\.\\pipe\\rsp" });
+```
+
+`RawTcpClientOptions`：
+
+| 選項 | 預設 | 說明 |
+|---|---|---|
+| `mode` | `"mux"` | 必須跟 server 的 mode 一致（不然 hello envelope 路由不到對的 endpoint）。 |
+| `tls` | — | `tls.ConnectionOptions`。傳 `{}` 用系統 CA + verify；私有 CA 傳 `{ ca, servername }`；本地自簽用 `{ rejectUnauthorized: false }`。`path:` target 會被忽略。 |
+| `keep_alive` | `true`（30 秒） | TCP keepalive。 |
+| `auth` | — | hello envelope 帶過去給 server `auth_validator`。 |
+| `logger` | 預設 | 注入自訂 `Logger`。 |
+
+完整 transport 行為對照（reconnect / backpressure / TLS / 效能…）看 [server README](../remote-serialport-server/README.md#raw-tcp--unix-domain-socket--named-pipe-rawtcpserver)。
+
+#### Raw WebSocket（`RawWebSocketClient`）
+
+用 `ws` 函式庫的 WebSocket 走線（server 端 `RawWebSocketServer` 的對應）。同 `mode` 選項，連線目標用 URL 形式：`ws://` 不加密、`wss://` TLS。
+
+```javascript
+const { RemoteSerialportClient, RawWebSocketClient } = require("node-serialport-client");
+
+// Plain ws，mux 模式（預設）
+new RemoteSerialportClient("", {
+    transport_client: new RawWebSocketClient({ url: "ws://localhost:17996" })
+});
+
+// TLS (wss)
+new RawWebSocketClient({ url: "wss://remote:17997" }, {
+    tls: { ca: ca_cert, servername: "remote" }    // production 私有 CA
+});
+new RawWebSocketClient({ url: "wss://localhost:17997" }, {
+    tls: { rejectUnauthorized: false }            // 本地自簽 cert 開發用
+});
+
+// 1-to-1
+new RawWebSocketClient({ url: "ws://localhost:17998" }, { mode: "single-namespace" });
+```
+
+`RawWebSocketClientOptions`：
+
+| 選項 | 預設 | 說明 |
+|---|---|---|
+| `mode` | `"mux"` | 必須跟 server 的 mode 一致。 |
+| `tls` | — | 直接轉給 `ws` constructor 的 options object — 支援 `ca` / `cert` / `key` / `passphrase` / `rejectUnauthorized` / `servername` 等。`url` 是 `wss://` 時才有作用。 |
+| `auth` | — | hello envelope 帶過去給 server `auth_validator`。 |
+| `logger` | 預設 | 注入自訂 `Logger`。 |
+
+跟 socket.io 比，`RawWebSocketClient` 跳過 Engine.IO 的 polling fallback，binary throughput 略高（localhost 實測 ~44 MB/s vs socket.io 同硬體 ~18 MB/s）。要 Engine.IO 的 reconnect / auto-fallback 還是用 socket.io；要薄一點、TCP-only 的就用 Raw WebSocket。
+
+#### HTTP/2（`Http2Client`）
+
+用 Node 內建 `node:http2`。每次 `open(label)` 在共用 session 上開一條 `:path: label` 的 stream，吃 HTTP/2 的 per-stream flow control（namespace 之間沒 HOL blocking）。
+
+```javascript
+const { RemoteSerialportClient, Http2Client } = require("node-serialport-client");
+
+// h2 over TLS
+new RemoteSerialportClient("", {
+    transport_client: new Http2Client(
+        { url: "https://remote:17996" },
+        { tls: { ca: ca_cert, servername: "remote" } }
+    )
+});
+
+// h2c cleartext（信任內網）
+new Http2Client({ url: "http://localhost:17997" });
+```
+
+`Http2ClientOptions`：
+
+| 選項 | 預設 | 說明 |
+|---|---|---|
+| `tls` | — | `http2.SecureClientSessionOptions`，直接給 `http2.connect`。自簽 dev 用 `{ rejectUnauthorized: false }`；production 私有 CA 用 `{ ca, servername }`。只在 `https://` URL 下生效。 |
+| `h2_options` | — | 額外 h2 session 選項（settings、peer max concurrent streams…）。 |
+| `auth` | — | 每條 stream 的 `hello` envelope 帶過去給 server `auth_validator`。 |
+| `logger` | 預設 | 注入自訂 `Logger`。 |
+
+HTTP/2 在 p99 latency 是內建 transport 裡最好的（localhost 實測 1.48 ms），throughput 在 Raw TCP 跟 socket.io 之間（~17 MB/s）。
+
+#### MQTT broker pattern（`MqttRsClient`）
+
+對 MQTT broker pub-sub；按 client/namespace 在 c2s topic 發、s2c topic 收。`MqttServer` 的對應 client。export 名稱用 `MqttRsClient`（避免跟 `mqtt` 函式庫的 `MqttClient` 撞名）。
+
+```javascript
+const { RemoteSerialportClient, MqttRsClient } = require("node-serialport-client");
+
+new RemoteSerialportClient("", {
+    transport_client: new MqttRsClient({
+        broker_url: "mqtt://broker.internal:1883",
+        topic_prefix: "rsp",
+        qos: 1,
+        auth: { token: "..." },
+        mqtt_options: { username: "u", password: "p" }
+    })
+});
+```
+
+`MqttClientOptions`：
+
+| 選項 | 預設 | 說明 |
+|---|---|---|
+| `broker_url` | （必填） | 跟 server 同一個 URL。 |
+| `topic_prefix` | `"rsp"` | 跟 server 的 prefix 一致。 |
+| `client_id` | 隨機 UUID | 進 MQTT clientId 跟 c2s/s2c topic path。 |
+| `qos` | `1` | 1 或 2；serial stream 絕不能用 0。 |
+| `mqtt_options` | — | 直接給 `mqtt.connect`。 |
+| `auth` | — | `hello` envelope 帶過去給 server `auth_validator`。 |
+| `logger` | 預設 | 注入自訂 `Logger`。 |
+
+MQTT 適合「server / client 雙方都只認 broker」的解耦部署，broker 還能撐住任一邊的網路短斷。但延遲最差（broker round-trip 在 p99 比所有直連 transport 都高），純求速度不要選它。
+
+#### gRPC（`GrpcClient`）
+
+包 `@grpc/grpc-js`。每次 `open(label)` 開一條 bi-directional `Channel` streaming RPC，metadata 帶 `rsp-label: <label>` 跟（選填）`rsp-auth: <JSON>`。`GrpcServer` 的對應。
+
+```javascript
+const { RemoteSerialportClient, GrpcClient } = require("node-serialport-client");
+const grpc = require("@grpc/grpc-js");
+
+// Insecure
+new RemoteSerialportClient("", {
+    transport_client: new GrpcClient({ address: "localhost:17996" })
+});
+
+// TLS
+const tls_creds = grpc.credentials.createSsl(fs.readFileSync("ca.crt"));
+new GrpcClient(
+    { address: "remote:17997" },
+    {
+        credentials: tls_creds,
+        channel_options: { "grpc.ssl_target_name_override": "remote" }
+    }
+);
+```
+
+`GrpcClientOptions`：
+
+| 選項 | 預設 | 說明 |
+|---|---|---|
+| `credentials` | `grpc.credentials.createInsecure()` | 標準 `ChannelCredentials`。 |
+| `channel_options` | — | per-channel options（`grpc.ssl_target_name_override`、`grpc.max_receive_message_length` 等）。 |
+| `auth` | — | 每次 stream open 時當作 `rsp-auth` metadata（JSON 編碼）送出。 |
+| `logger` | 預設 | 注入自訂 `Logger`。 |
+
+`.proto` 隨 client package 出貨，放在 `proto/remote-serialport.proto`，第一次 `open()` 時載入。
+
+#### WebRTC DataChannel（`WebRtcClient`）— experimental
+
+真 P2P transport。每次 `open(label)` 在 peer connection 上開一條新的 DataChannel。Signaling 自己準備。`WebRtcServer` 的對應。
+
+```javascript
+const { RemoteSerialportClient, WebRtcClient } = require("node-serialport-client");
+
+const signaling = {
+    on_message(handler) { /* 從 server 端收到 offer / answer / candidate */ },
+    send(msg) { /* 轉給 server */ }
+};
+
+new RemoteSerialportClient("", {
+    transport_client: new WebRtcClient({
+        signaling,
+        ice_servers: ["stun:stun.l.google.com:19302"]
+    })
+});
+```
+
+`WebRtcClientOptions`：
+
+| 選項 | 預設 | 說明 |
+|---|---|---|
+| `signaling` | （必填） | `WebRtcSignalingChannel` adapter；shape 請看 server README。 |
+| `ice_servers` | `["stun:stun.l.google.com:19302"]` | 字串陣列；node-datachannel 不接受 W3C object 格式。 |
+| `peer_id` | 隨機 UUID | 本端 peer 的穩定 ID，會帶在每個 signaling 訊息中。 |
+| `logger` | 預設 | 注入自訂 `Logger`。 |
+
+library 帶了 `node-datachannel`（native dep，libdatachannel + libsrtp + libjuice）。walkthrough 的 [webrtc-smoke.js](../note/walkthrough/webrtc-smoke.js) 用 in-process EventEmitter 當 signaling，不用真實 signaling server 就能試。
 
 ### 協定（v2）
 
