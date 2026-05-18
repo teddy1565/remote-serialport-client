@@ -9,22 +9,14 @@ import {
     TransportMessageListener
 } from "../types/remote-serialport-types/src/transport";
 import { Logger } from "../types/remote-serialport-types/src/logger";
+import { WebRtcSignalingChannel, WebRtcSignalingMessage } from "../types/remote-serialport-types/src/webrtc";
 import { default_logger } from "./logger";
 import { Envelope, FrameDecoder, encode } from "./shared/envelope-codec";
 
-export interface WebRtcSignalingMessage {
-    kind: "offer" | "answer" | "candidate";
-    peer_id: string;
-    sdp?: string;
-    sdp_type?: "offer" | "answer";
-    candidate?: string;
-    mid?: string;
-}
-
-export interface WebRtcSignalingChannel {
-    on_message(handler: (msg: WebRtcSignalingMessage) => void): void;
-    send(msg: WebRtcSignalingMessage): void;
-}
+// Re-export the shared signaling types so existing `import { WebRtcSignalingChannel } from
+// "node-serialport-client"` paths keep resolving. Single source of truth lives in the types
+// submodule (`remote-serialport-types/src/webrtc.ts`).
+export { WebRtcSignalingChannel, WebRtcSignalingMessage };
 
 export interface WebRtcClientOptions {
     signaling: WebRtcSignalingChannel;
@@ -222,6 +214,10 @@ export class WebRtcClient extends AbsTransportClient {
         const dc: DataChannel = peer.createDataChannel(label);
         const transport = new WebRtcClientTransport(label, dc, this._logger);
         this._transports.set(label, transport);
+        // M7: prune on per-transport disconnect (DataChannel close fires lifecycle disconnect).
+        transport.on_lifecycle("disconnect", (): void => {
+            if (this._transports.get(label) === transport) this._transports.delete(label);
+        });
         return transport;
     }
 

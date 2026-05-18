@@ -52,6 +52,13 @@ export interface RemoteSerialportClientOptions {
      * credential directly in that case.
      */
     auth?: unknown;
+    /**
+     * Extra options forwarded to socket.io's `Manager(uri, opts)` constructor. Use this for TLS
+     * settings (`rejectUnauthorized`, `ca`), to force transports (`transports: ["websocket"]`),
+     * tune reconnect cadence, etc. Only honored when using the default socket.io transport (i.e.
+     * `transport_client` is not set).
+     */
+    manager_options?: import("./module/socketio-transport").SocketIoClientTransportOptions["manager_options"];
 }
 
 /**
@@ -85,7 +92,23 @@ export class RemoteSerialportClient extends AbsRemoteSerialportClient {
         this._logger = options.logger ?? default_logger;
         this._rpc_options = options.rpc ?? {};
         this._txn_id_allocator = options.txn_id_allocator ?? "counter";
-        this._transport_client = options.transport_client ?? new SocketIoClient(server_host, { ...this._rpc_options, logger: this._logger, auth: options.auth });
+        if (options.transport_client !== undefined && options.auth !== undefined) {
+            // The top-level `auth` field only wires through to the default SocketIoClient. When the
+            // caller injects their own `transport_client` we cannot retroactively set its auth, so
+            // the credential would silently never reach the server. Tell them to put auth in the
+            // transport's own options object instead.
+            this._logger.warn(
+                "RemoteSerialportClient: top-level `auth` option is ignored when `transport_client` " +
+                "is provided. Pass the credential into the transport's own constructor options instead " +
+                "(e.g. `new RawTcpClient({...}, { auth: ... })`, `new MqttRsClient({..., auth: ... })`)."
+            );
+        }
+        this._transport_client = options.transport_client ?? new SocketIoClient(server_host, {
+            ...this._rpc_options,
+            logger: this._logger,
+            auth: options.auth,
+            manager_options: options.manager_options
+        });
         this.serialport_check_regexp = options.serialport_check_regexp ?? DEFAULT_SERIALPORT_CHECK_REGEXP;
     }
 

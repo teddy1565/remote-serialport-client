@@ -212,6 +212,10 @@ export class GrpcClient extends AbsTransportClient {
         const call: grpc.ClientDuplexStream<ProtoEnvelope, ProtoEnvelope> = client.Channel(metadata);
         const transport = new GrpcClientStreamTransport(label, call, this._logger);
         this._transports.set(label, transport);
+        // M7: prune on per-transport disconnect.
+        transport.on_lifecycle("disconnect", (): void => {
+            if (this._transports.get(label) === transport) this._transports.delete(label);
+        });
         return transport;
     }
 

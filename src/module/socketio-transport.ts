@@ -1,4 +1,4 @@
-import { Manager, Socket } from "socket.io-client";
+import { Manager, ManagerOptions, Socket, SocketOptions } from "socket.io-client";
 
 import {
     AbsTransport,
@@ -33,6 +33,19 @@ export interface SocketIoClientTransportOptions {
      * re-sends it on every reconnect so the server can re-run its `auth_validator`.
      */
     auth?: unknown;
+    /**
+     * Extra options forwarded to the underlying `socket.io-client` `Manager` constructor.
+     *
+     * Use this to pass TLS settings for `wss://` / `https://` URLs (e.g.
+     * `{ rejectUnauthorized: false }` for self-signed dev certs, or `{ ca: ca_cert }` for a
+     * private CA), force transports (`{ transports: ["websocket"] }`), tune reconnect cadence,
+     * etc. The library does NOT inspect these — they go straight through to socket.io's
+     * `Manager(uri, opts)`.
+     *
+     * Mirrors how the other transports surface their library-specific options (mqtt's
+     * `mqtt_options`, http2's `h2_options`, etc.).
+     */
+    manager_options?: Partial<ManagerOptions & SocketOptions>;
 }
 
 /** Historical name retained for the public option surface on `RemoteSerialportClient`. */
@@ -213,7 +226,12 @@ export class SocketIoClient extends AbsTransportClient {
 
     constructor(server_host: string, transport_options: SocketIoClientTransportOptions = {}) {
         super();
-        this.manager = new Manager(server_host);
+        // D12: forward `manager_options` to socket.io's `Manager(uri, opts)` so callers can
+        // configure TLS (`rejectUnauthorized`, `ca`, etc.) and other transport-level settings
+        // without having to inject a custom AbsTransportClient.
+        this.manager = transport_options.manager_options !== undefined
+            ? new Manager(server_host, transport_options.manager_options)
+            : new Manager(server_host);
         this._transport_options = transport_options;
     }
 

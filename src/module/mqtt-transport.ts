@@ -222,17 +222,44 @@ export class MqttClient_ extends AbsTransportClient {
         };
         const transport = new MqttClientTransport(label, this._client_id, publish);
         this._transports.set(label, transport);
+        // M7: prune on per-transport disconnect (e.g. server publishes bye, or app calls
+        // transport.close() explicitly).
+        transport.on_lifecycle("disconnect", (): void => {
+            if (this._transports.get(label) === transport) this._transports.delete(label);
+        });
         // Send hello envelope to register at server.
         publish(encode({ k: "hello", label, auth: this._auth }));
+        // D10 + F13: if the broker is already connected + SUBACK'd, the bulk fire_connect at
+        // `_mqtt_ready=true` has already run for the existing transports — late-arriving
+        // open(label)s would never see their `connect` lifecycle fire. Schedule via setImmediate
+        // (not process.nextTick) so users attaching listeners via Promise.then / await also
+        // catch the event.
+        if (this._mqtt_ready === true) {
+            setImmediate((): void => { try { transport._fire_connect(); } catch { /* swallow */ } });
+        }
         return transport;
     }
 
     close(): void {
         if (this._closed) return;
         this._closed = true;
-        for (const t of this._transports.values()) { try { t._on_remote_close(); } catch {} }
+        // Each child's close() publishes a `bye` envelope before flipping itself local-closed.
+        // Without that the server keeps the per-(client_id, label) transport (and any shared
+        // session it owns) registered — pipe-mode writer-promotion would never re-fire.
+        for (const t of this._transports.values()) { try { t.close(); } catch {} }
         this._transports.clear();
-        if (this._client !== null) { try { this._client.end(true); } catch {} this._client = null; }
+        if (this._client !== null) {
+            const client = this._client;
+            this._client = null;
+            // Graceful end (force=false) so the queued bye publishes drain.
+            // Fallback force-end after 1 s in case the broker is unresponsive — app shutdown
+            // must never block on a stuck mqtt session.
+            let done = false;
+            const finalize = (): void => { if (done) return; done = true; try { client.end(true); } catch {} };
+            try { client.end(false, {}, finalize); } catch { finalize(); }
+            const t = setTimeout(finalize, 1000);
+            if (typeof (t as { unref?: () => void }).unref === "function") (t as { unref: () => void }).unref();
+        }
     }
 }
 

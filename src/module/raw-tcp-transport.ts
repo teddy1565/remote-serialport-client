@@ -124,6 +124,14 @@ class ClientMux {
                 return;
             }
             case "ack": {
+                // D5: route by `ns` when present (mux mode). ack_id counters are per-transport,
+                // so a pre-D5 broadcast could resolve the wrong promise when two transports on
+                // the same mux had pending acks with the same id.
+                if (this._mode === "mux" && typeof env.ns === "string") {
+                    const t = this._transports.get(env.ns);
+                    t?._dispatch_ack(env);
+                    return;
+                }
                 for (const t of this._transports.values()) t._dispatch_ack(env);
                 return;
             }
@@ -275,7 +283,11 @@ class RawTcpClientTransport extends AbsTransport {
         const ack_id: number | undefined = typeof env.ack === "number" ? env.ack : undefined;
         const ack_cb: TransportAckCallback | undefined = ack_id !== undefined
             ? (response: unknown): void => {
-                  this._mux.send_envelope({ k: "ack", ack: ack_id, r: response });
+                  // D5: tag ack with `ns` so the peer's ConnectionMux can route by transport.
+                  const reply_env: Envelope = this._mux.mode === "mux"
+                      ? { k: "ack", ns: this._label, ack: ack_id, r: response }
+                      : { k: "ack", ack: ack_id, r: response };
+                  this._mux.send_envelope(reply_env);
               }
             : undefined;
         for (const l of listeners) {
@@ -353,6 +365,11 @@ export class RawTcpClient extends AbsTransportClient {
         }
         const transport: RawTcpClientTransport = new RawTcpClientTransport(label, mux);
         this._transports.set(label, transport);
+        // M7: prune the Map when this individual transport dies so long-running clients that
+        // open/close many labels don't accumulate dead entries.
+        transport.on_lifecycle("disconnect", (): void => {
+            if (this._transports.get(label) === transport) this._transports.delete(label);
+        });
         mux.register_transport(label, transport);
         return transport;
     }

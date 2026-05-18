@@ -211,6 +211,11 @@ export class Http2Client extends AbsTransportClient {
         const stream: ClientHttp2Stream = session.request({ ":path": label, ":method": "POST" });
         const transport = new Http2ClientStreamTransport(label, stream, this._opts.auth, this._logger);
         this._transports.set(label, transport);
+        // M7: prune on per-transport disconnect (long-running clients reusing the same session
+        // can accumulate dead stream transports if many labels are opened+closed).
+        transport.on_lifecycle("disconnect", (): void => {
+            if (this._transports.get(label) === transport) this._transports.delete(label);
+        });
         return transport;
     }
 

@@ -6,6 +6,12 @@
 
 ## English
 
+> **⚠ Node.js only.** This library uses Node's `Buffer`, `worker_threads`, `node:http2`, the
+> native `serialport` binding, and other Node-specific APIs. It **does not work in browsers**
+> — bundling it via webpack / Vite / Rollup will fail at `Buffer`/`stream`/`net` imports.
+> For a browser front-end, write a thin app-layer adapter against your own WebSocket / WebRTC
+> and forward bytes — don't try to load this package in the browser.
+
 Proxy a host's physical serial ports over the network: the **server** holds the real serial ports;
 the **client** connects and gets a local *virtual* serial port (a mock-binding–backed
 `SerialPortStream`) that mirrors a remote one. Reads/writes on the virtual port are forwarded to the
@@ -138,6 +144,22 @@ All `RemoteSerialportClientOptions`:
 | `txn_id_allocator` | `'counter'` | `'counter'` (per-socket monotonic), `'uuid'`, or `() => string`. |
 | `auth` | — | Credential forwarded to the server's `auth_validator`. socket.io → `Manager({auth})`; IPC → `hello` envelope. Auto-replayed on reconnect. |
 | `transport_client` | `new SocketIoClient(host, ...)` | Inject a custom transport (e.g. `NodeIpcClient`). |
+| `manager_options` | — | Extra options forwarded to socket.io's `Manager(uri, opts)` ctor. Use this for TLS settings (`{ rejectUnauthorized: false, ca: ca_cert }` for `wss://`), forced transports (`{ transports: ["websocket"] }`), reconnect cadence, etc. Only honored on the default socket.io transport. |
+
+#### `wss://` example
+
+```javascript
+const rsc = new RemoteSerialportClient("wss://your-host:17991", {
+  manager_options: {
+    transports: ["websocket"],
+    rejectUnauthorized: false,        // dev only; for production use `ca: production_ca`
+    ca: my_ca_pem,                    // private-CA chain (production)
+  }
+});
+```
+
+The matching server side attaches its `srv.io` to an `https.Server` — see the
+[server README's TLS section](../remote-serialport-server/README.md#encryption--tls).
 
 ### Namespace mode — manual open
 
@@ -238,6 +260,12 @@ await portInst.with_txn(async (tx) => {
 - Server-side timeout (`txn_timeout_ms`, default 5s, **resets on every chunk**) drops buffered chunks
   if no `_end` / `_abort` arrives.
 - Only `_end` consumes a slot in the client's send window; `_begin` / `_chunk` / `_abort` are free.
+- **Calling `tx.abort()` *inside* a `with_txn(async (tx) => …)` callback** causes the wrapper's
+  implicit `_end` to find the handle already in `aborted` state and reject the promise with
+  `"txn N was aborted"`. The rollback DID happen (bytes never reach the device), but
+  `with_txn` itself throws. For non-throwing explicit abort, use the lower-level
+  `portInst.txn()` handle directly and call `tx.abort()` outside any `with_txn` wrapper — as
+  in the first example above.
 
 ### Logger
 
@@ -274,6 +302,22 @@ const rsc = new RemoteSerialportClient("ws://localhost:17991", {
   txn_id_allocator: "counter", // or "uuid" or () => string
 });
 ```
+
+**Abrupt transport disconnect (server crash, kernel reset, etc.)** — when the underlying
+transport fires its `disconnect` lifecycle and no `reconnect` happens within **500 ms**, the
+client propagates the loss to every open local virtual stream:
+
+```javascript
+port.on("error", (e) => { /* e.message === "transport disconnected" */ });
+port.on("close", () => { /* fired right after error */ });
+```
+
+On socket.io's auto-reconnect, a transient blip fires `disconnect` followed by `reconnect`
+within ms — the 500 ms grace timer cancels and the local stream sees no event, so the
+recovery is invisible to apps. On the single-shot transports (Raw TCP / Raw WS / HTTP/2 /
+gRPC) the disconnect almost always means "permanently gone" and the error+close events fire.
+MQTT goes through the broker so the keepalive (~60 s default) must expire before the server's
+loss surfaces — tune `mqtt_options.keepalive` if you need faster detection.
 
 ### Shared mode (`multi_access: 'shared'`)
 
@@ -320,8 +364,23 @@ const rsc = new RemoteSerialportClient("ws://example:17991", {
 ```
 
 On the default socket.io transport, `auth` lands in the `Manager({auth})` field and is replayed
-on every reconnect, so the server's `auth_validator` re-runs after each transport drop. On IPC
-construct your own `NodeIpcClient(port, label, credential)` and pass it via `transport_client`.
+on every reconnect, so the server's `auth_validator` re-runs after each transport drop.
+
+> **Gotcha — top-level `auth` is only wired for the default socket.io transport.** If you
+> inject your own `transport_client` (Raw TCP / Raw WebSocket / HTTP/2 / MQTT / gRPC), the
+> top-level `auth` option is **silently dropped** — pass the credential into the transport's
+> own constructor options instead:
+>
+> ```javascript
+> // Right way for non-socket.io transports:
+> new RemoteSerialportClient("", { transport_client: new RawTcpClient({host, port}, { auth: cred }) });
+> new RemoteSerialportClient("", { transport_client: new MqttRsClient({broker_url, auth: cred }) });
+> new RemoteSerialportClient("", { transport_client: new Http2Client({url}, { auth: cred }) });
+> ```
+>
+> If you accidentally combine top-level `auth` with a user-supplied `transport_client`, the
+> library logs a `warn` at construction time explaining how to fix it. WebRTC carries no
+> app-level auth by design — gate connections at the signaling layer.
 
 When the server denies auth, the connection closes without a `serialport_handshake`; locally that
 manifests as a stream that never reaches `open` (the local virtual port stays in `idle`). The
@@ -521,6 +580,32 @@ broker's address and the broker can survive network blips on either side. Don't 
 need the lowest possible latency — at-source-broker round-trips push p99 well above the direct
 transports.
 
+**Graceful disconnect**: `rsc.disconnect()` (and `MqttRsClient.close()`) publishes a `bye`
+envelope on each open `<prefix>/c2s/<client_id>/<label>` topic before ending the broker
+connection (with a 1 s graceful-end + force-end fallback). The server clears its per-(client,
+label) transport state immediately on receipt instead of waiting for the keepalive to expire,
+so shared-mode writer-promotion (`pipe` mode) re-fires the moment the writer leaves rather
+than ~60 s later.
+
+> **⚠ QoS 1 retransmits and write-critical workloads.** MQTT QoS 1 is "at-least-once":
+> under packet loss, the broker may redeliver the same PUBLISH and the receiver acks each
+> copy. **This library does NOT deduplicate retransmitted messages at the application
+> layer** — if the network drops a PUBACK and the broker resends, a `serialport_send_packet`
+> envelope can reach the device's port **twice**, writing the same Modbus PDU / RS-485
+> command twice. For write-idempotent workloads (status polling, log streaming) this is
+> usually fine. For write-critical workloads (commanding actuators, Modbus function-code
+> 5/6/15/16) one of the following is required:
+>
+> - Set `qos: 2` (exactly-once; broker uses 4-step handshake — higher latency, no
+>   duplicates).
+> - Use a different transport (Raw TCP / Raw WS / HTTP/2) where the underlying TCP stream
+>   gives in-order non-duplicated delivery.
+> - Dedup at the app layer by stamping each command with a sequence number.
+>
+> **MQTT KeepAlive defaults to ~60 s** in the `mqtt` lib: a dead server is not detected on
+> the client side until KeepAlive expires. Tune via `mqtt_options.keepalive` if you need
+> faster failure detection.
+
 #### gRPC (`GrpcClient`)
 
 Wraps `@grpc/grpc-js`. Each `open(label)` opens a new bi-directional `Channel` streaming RPC
@@ -664,6 +749,8 @@ crosses 1 MB; resumes once below 256 KB. Only in `multi_access: 'reject'` mode (
 
 ## 中文
 
+> **⚠ Node.js 限定。** 用了 Node 的 `Buffer`、`worker_threads`、`node:http2`、native `serialport` binding 等 Node 專屬 API。**瀏覽器跑不起來** — 用 webpack / Vite / Rollup 打包會在 `Buffer`/`stream`/`net` import 直接炸。要做瀏覽器前端，請自己寫一層薄薄的 app-layer adapter（搭配你自己的 WebSocket / WebRTC）把 bytes 轉過去 — 不要試圖直接 bundle 這個 package 進 browser。
+
 把主機的實體序列埠透過網路代理出去：**server** 守住真實的序列埠；**client** 連上來，拿到一個本地 *虛擬* 序列埠（用 mock-binding 撐起來的 `SerialPortStream`）對應某個遠端埠。對虛擬埠的讀寫會轉發到實體埠，反之亦然 — 既有的 Node serialport 生態（`serialport`、`modbus-serial` …）幾乎零修改就能跨網路使用。
 
 專案拆三個 package：
@@ -707,6 +794,21 @@ npm install node-serialport-client   # client
 | `txn_id_allocator` | `'counter'` | `'counter'`（per-socket 遞增）/ `'uuid'`（每筆 UUID）/ 自訂函式。 |
 | `auth` | — | 認證 credential；socket.io 走 `Manager.socket(label, { auth })`，IPC 走 `hello` envelope。重連自動 replay。 |
 | `transport_client` | `new SocketIoClient(host, ...)` | 注入自訂 transport（例如 `NodeIpcClient`）。 |
+| `manager_options` | — | 直接 forward 到 socket.io `Manager(uri, opts)` 的 options。`wss://` TLS 設定（`{ rejectUnauthorized: false, ca: ca_cert }`）、強制 transport（`{ transports: ["websocket"] }`）、reconnect cadence 等都從這裡進去。只有預設 socket.io transport 會用到。 |
+
+##### `wss://` 用法
+
+```javascript
+const rsc = new RemoteSerialportClient("wss://your-host:17991", {
+  manager_options: {
+    transports: ["websocket"],
+    rejectUnauthorized: false,        // dev only；production 用 `ca: production_ca`
+    ca: my_ca_pem,                    // 私 CA chain（production）
+  }
+});
+```
+
+Server 端要把自己的 `srv.io` 接到 `https.Server` — 見 [server README 的 TLS section](../remote-serialport-server/README.md#encryption--tls)。
 
 #### Namespace mode — 手動 open
 
@@ -746,6 +848,7 @@ await tx.end();   // 在 server 端被當成 ONE atomic write 到 device
 - `_begin` → 0..N 個 `_chunk` → `_end`（送 device）或 `_abort`（drop）
 - 只有 `_end` 跟單發 `serialport_send_packet` 消耗背壓窗口
 - Server-side timeout（每 chunk reset）：drop buffered chunks（行為由 `txn_timeout_action` 決定）
+- **在 `with_txn(async (tx) => …)` callback 內呼叫 `tx.abort()`**：wrapper 的隱式 `_end` 會看到 handle 已 abort 然後 reject promise（訊息 `"txn N was aborted"`）。Rollback 確實發生了（bytes 沒送到 device），但 `with_txn` 自己會 throw。要 explicit abort 又不想 throw，就用底層 `portInstance.txn()` handle 直接呼叫 `tx.abort()`（在 `with_txn` wrapper 外），如上面第一個範例。
 
 ### Logger
 
@@ -767,6 +870,21 @@ interface Logger {
 - In-flight RPC：option `rpc.replay_on_reconnect`（預設 `true`）— `connect` 事件 fire 時把 `_pending_rpcs` 全部用同一個 ack callback 重發；timeout 是從第一次呼叫起算的 wall-clock（不重置）。若 `false` → `disconnect` 事件當下直接 reject 全部 pending
 - IPC transport：無 reconnect。`on_lifecycle("reconnect")` 永不 fire
 
+**Server 崩潰 / 連線被硬切時的本地行為**：底層 transport `disconnect` lifecycle 觸發後 **500 ms 內**沒有 `reconnect`，client 會把 loss 推到每個 open 的本地虛擬 stream：
+
+```javascript
+port.on("error", (e) => { /* e.message === "transport disconnected" */ });
+port.on("close", () => { /* 緊接著 error 觸發 */ });
+```
+
+socket.io 的自動重連在 grace 內完成時 timer 會 cancel，本地 stream 看不到任何事件 — 短暫斷線對 app 是透明的。單發類 transport（Raw TCP / Raw WS / HTTP/2 / gRPC）幾乎一定就是「永久斷」所以 error+close 會 fire。MQTT 因為走 broker，server 真正掉線要等 broker keepalive 過期（預設 ~60 s）— 想要更快偵測請調 `mqtt_options.keepalive`。
+
+**注意 — `conn.state` vs 本地 stream 的 `'open'` 事件**：`conn.state` 反映**遠端**物理埠的狀態（由 server 推送的 `serialport_state` 驅動）。本地虛擬 `SerialPortStream` 的 `'open'` 事件在 MockBinding open 完成的當下就 fire，那發生在 `conn.state` 轉成 `"open"` **之前**。如果要 gate「真的能寫了沒」在遠端埠就緒，請聽 `port_instance.on("data", …)` 確認 fanout live，或 poll/watch `conn.state`（v2 沒有暴露 state-changed listener — 用本地 stream 的 `'error'` / `'close'` 事件 + `conn.state` snapshot 來追）。
+
+### Wire backpressure（device→client，僅參考；server 端控制）
+
+`socket.pipe()` forward 物理 bytes 比 client drain 還快時，server 採樣底層 socket.io transport 的 `bufferedAmount`；超過 `WIRE_BACKPRESSURE_HIGH_WATER`（1 MB）就 `pause()` 物理埠；低於 `WIRE_BACKPRESSURE_LOW_WATER`（256 KB）就 `resume()`。只在 `multi_access: 'reject'` 模式生效（shared 模式 pause/resume 會餓死其它 subscriber）。IPC transport 的 `get_buffered_amount()` 回 `null`，跳過 wire backpressure。詳細請看 [server README 中文段 Wire backpressure](../remote-serialport-server/README.md#wire-backpressuredeviceclient)。
+
 ### Shared mode（`multi_access: 'shared'`）
 
 由 server 控制 — client 無需特別設定，只要兩個以上 client 連到同一條 path 就生效。client 看到的差別是讀方向有 fanout、寫方向可能被 server-side scheduling 影響（per-mode 行為詳見 server README 中文段「Shared mode」表）。
@@ -780,6 +898,16 @@ const rsc = new RemoteSerialportClient("ws://example:17991", {
 ```
 
 預設 socket.io transport：`auth` 落在 `Manager.socket(label, { auth })`，**每次重連自動 replay**，server 端 `auth_validator` 每次都重跑。IPC 場景請自己 `new NodeIpcClient(port, label, credential)` 然後 `transport_client: ...` 注入。
+
+> **注意 — top-level `auth` 只對預設的 socket.io 有效**。如果注入了自己的 `transport_client`（Raw TCP / Raw WebSocket / HTTP/2 / MQTT / gRPC），top-level `auth` 會**靜默被丟棄** — credential 請傳進 transport 自己的 ctor options：
+>
+> ```javascript
+> new RemoteSerialportClient("", { transport_client: new RawTcpClient({host, port}, { auth: cred }) });
+> new RemoteSerialportClient("", { transport_client: new MqttRsClient({broker_url, auth: cred }) });
+> new RemoteSerialportClient("", { transport_client: new Http2Client({url}, { auth: cred }) });
+> ```
+>
+> 如果不小心 top-level `auth` 跟 user-supplied `transport_client` 同時給，library 會在 constructor 時 log `warn` 提示你怎麼修。WebRTC 設計上沒帶 app-level auth — 認證請放 signaling 那層。
 
 Server 拒絕 auth 時：連線關閉、handshake 永遠不會收到 — 本地表現是「虛擬 stream 永遠到不了 `open` 狀態」（停在 `idle`）。server 那邊的 logger 跟 `serialport_state: ERROR` payload 才有拒絕原因。
 
@@ -946,6 +1074,14 @@ new RemoteSerialportClient("", {
 | `logger` | 預設 | 注入自訂 `Logger`。 |
 
 MQTT 適合「server / client 雙方都只認 broker」的解耦部署，broker 還能撐住任一邊的網路短斷。但延遲最差（broker round-trip 在 p99 比所有直連 transport 都高），純求速度不要選它。
+
+> **⚠ QoS 1 重送跟「寫關鍵」工作負載**：QoS 1 是「至少送達一次」。掉包時 broker 重送 PUBLISH。**library 不會在 application layer 對重送訊息去重** — PUBACK 路上掉了 broker 重送的話，一個 `serialport_send_packet` envelope 可能會抵達裝置埠**兩次**，把同一個 Modbus PDU / RS-485 command 寫兩次。寫入冪等（狀態輪詢、log streaming）沒差；**寫關鍵**（操作 actuator、Modbus function-code 5/6/15/16）需要：
+>
+> - 設 `qos: 2`（剛好一次；4-step handshake，延遲較高但不會重複）。
+> - 換不同 transport（Raw TCP / Raw WS / HTTP/2），底層 TCP 自帶 in-order 不重複。
+> - 在 app 層自己用 sequence number 戳每筆命令去重。
+>
+> **`mqtt` lib 的 KeepAlive 預設 ~60 秒**：server 真的掛了 client 端要 60 秒才偵測到。`mqtt_options.keepalive` 調短可加快偵測。
 
 #### gRPC（`GrpcClient`）
 

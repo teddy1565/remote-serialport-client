@@ -522,6 +522,45 @@ export class RemoteSerialClientSocket extends AbsRemoteSerialportClientSocket {
             this._open_sent = false;
         });
 
+        // Surface abrupt transport disconnect (e.g. server crash, network drop with no
+        // protocol-level close) to the local virtual stream. Without this, the transport's
+        // disconnect lifecycle fires but `port.on("error" / "close")` never does, so naive
+        // serialport code hangs waiting on a dead remote. We wait a grace period so the
+        // auto-reconnecting transports (socket.io) get to recover transparently and don't spam
+        // ERROR on transient blips.
+        this._transport.on_lifecycle("disconnect", (): void => {
+            if (this._port_instances.size === 0) return; // user disconnect already cleared map
+            let listener_removed = false;
+            let on_reconnect: (() => void) | null = null;
+            const remove_listener = (): void => {
+                if (listener_removed === true || on_reconnect === null) return;
+                listener_removed = true;
+                this._transport.off_lifecycle("reconnect", on_reconnect);
+            };
+            let cancelled = false;
+            const grace_timer: ReturnType<typeof setTimeout> = setTimeout((): void => {
+                remove_listener();
+                if (cancelled === true) return;
+                for (const instance of this._port_instances.values()) {
+                    // L1 collapse: always detach the on_reconnect listener when the timer fires
+                    // (previously only the reconnect branch removed it; storms of disconnects
+                    // with no reconnects would accumulate listeners until reconnect finally
+                    // fired). Now cleanup is guaranteed regardless of outcome.
+                    instance.set_state(RemoteSerialPortState.ERROR, "transport disconnected");
+                    instance.set_state(RemoteSerialPortState.CLOSED);
+                }
+            }, 500);
+            if (typeof (grace_timer as { unref?: () => void }).unref === "function") {
+                (grace_timer as { unref: () => void }).unref();
+            }
+            on_reconnect = (): void => {
+                cancelled = true;
+                clearTimeout(grace_timer);
+                remove_listener();
+            };
+            this._transport.on_lifecycle("reconnect", on_reconnect);
+        });
+
         this.on("serialport_handshake", (data: SocketServerSideEmitPayload_Handshake): void => {
             if (typeof data?.protocolVersion === "number" && data.protocolVersion !== REMOTE_SERIALPORT_PROTOCOL_VERSION) {
                 this._logger.warn(`protocol version mismatch: server=${data.protocolVersion}, client=${REMOTE_SERIALPORT_PROTOCOL_VERSION}`);
@@ -726,6 +765,30 @@ export class RemoteSerialClientMuxSocket extends AbsRemoteSerialportClientMuxSoc
 
         this._transport.on_lifecycle("connect", (): void => {
             this._handshaked = false;
+        });
+
+        // See namespace-mode equivalent: surface abrupt transport disconnect to local virtual
+        // streams across all open mux paths, after a grace period so auto-reconnect transports
+        // (socket.io) don't spam ERROR on transient drops.
+        this._transport.on_lifecycle("disconnect", (): void => {
+            if (this._port_instances.size === 0) return;
+            let cancelled = false;
+            const grace_timer: ReturnType<typeof setTimeout> = setTimeout((): void => {
+                if (cancelled === true) return;
+                for (const { instance } of this._port_instances.values()) {
+                    instance.set_state(RemoteSerialPortState.ERROR, "transport disconnected");
+                    instance.set_state(RemoteSerialPortState.CLOSED);
+                }
+            }, 500);
+            if (typeof (grace_timer as { unref?: () => void }).unref === "function") {
+                (grace_timer as { unref: () => void }).unref();
+            }
+            const on_reconnect = (): void => {
+                cancelled = true;
+                clearTimeout(grace_timer);
+                this._transport.off_lifecycle("reconnect", on_reconnect);
+            };
+            this._transport.on_lifecycle("reconnect", on_reconnect);
         });
 
         this.on("serialport_handshake", (data: SocketServerSideEmitPayload_Handshake): void => {

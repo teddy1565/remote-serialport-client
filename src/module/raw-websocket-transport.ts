@@ -105,6 +105,11 @@ class WsClientMux {
                 return;
             }
             case "ack": {
+                // D5: route by `ns` in mux mode. See raw-tcp-transport.ts for full context.
+                if (this._mode === "mux" && typeof env.ns === "string") {
+                    this._transports.get(env.ns)?._dispatch_ack(env);
+                    return;
+                }
                 for (const t of this._transports.values()) t._dispatch_ack(env);
                 return;
             }
@@ -228,7 +233,9 @@ class RawWebSocketClientTransport extends AbsTransport {
         if (listeners === undefined || listeners.size === 0) return;
         const ack_id: number | undefined = typeof env.ack === "number" ? env.ack : undefined;
         const ack_cb: TransportAckCallback | undefined = ack_id !== undefined
-            ? (r) => this._mux.send_envelope({ k: "ack", ack: ack_id, r })
+            ? (r) => this._mux.send_envelope(this._mux.mode === "mux"
+                  ? { k: "ack", ns: this._label, ack: ack_id, r }
+                  : { k: "ack", ack: ack_id, r })
             : undefined;
         for (const l of listeners) { try { l(env.p, ack_cb); } catch { /* isolated */ } }
     }
@@ -290,6 +297,10 @@ export class RawWebSocketClient extends AbsTransportClient {
         }
         const t = new RawWebSocketClientTransport(label, mux);
         this._transports.set(label, t);
+        // M7: prune on per-transport disconnect (see raw-tcp-transport.ts for context).
+        t.on_lifecycle("disconnect", (): void => {
+            if (this._transports.get(label) === t) this._transports.delete(label);
+        });
         mux.register_transport(label, t);
         return t;
     }

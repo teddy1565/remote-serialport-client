@@ -71,7 +71,8 @@ export class NodeIpcClientTransport extends AbsTransport {
         // before firing `on_connection`. Always sent — server-side endpoint blocks on this envelope.
         this._port.postMessage({ kind: "hello", auth: auth });
 
-        process.nextTick((): void => {
+        // F13: setImmediate (not process.nextTick) so Promise.then / await listeners catch it.
+        setImmediate((): void => {
             if (this._is_connected === true) {
                 this._fire_lifecycle("connect");
             }
