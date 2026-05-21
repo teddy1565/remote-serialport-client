@@ -37,14 +37,16 @@ device is physically plugged into, are not the same machine** — or not the sam
 same container. If your device and your code share a process, you don't need this; just use
 `serialport` directly. You want `remote-serialport` when one of these is true:
 
-| Scenario | Why this library helps |
-|---|---|
-| **Remote industrial / lab equipment.** A PLC, Modbus energy meter, RS-485 sensor bus, or bench instrument sits on a factory floor or a lab rack; your control / monitoring code runs on a server, a dev laptop, or a cloud VM. | Run `remote-serialport-server` on the small box wired to the equipment. Run your existing `modbus-serial` / `serialport` code anywhere and point it at a *virtual* port — almost zero code change. |
-| **Containerised / Kubernetes apps.** A container can't see host `/dev/ttyUSB0` without privileged device passthrough. | Run the server on the host (or one privileged sidecar); let unprivileged app containers connect over the network. No `--device`, no `--privileged`. |
-| **Shared access to one instrument.** Several engineers — or several services — need the same RS-485 line at once. | `multi_access: 'shared'` refcounts a single physical port, fans reads out to every client, and the `shared_mode` policy table arbitrates writes (FIFO, single-writer, COW snapshot, …). |
-| **Hardware-in-the-loop CI / test farms.** The device under test lives in a test rack; CI runners are elsewhere or ephemeral. | The server keeps the port; each CI job connects, runs, disconnects. Or inject a mock-backed `serialport_factory` and run the *same* suite with no hardware at all. |
-| **Electron / multi-process desktop apps.** The native `serialport` binding shouldn't load in your renderer process. | Keep `serialport` in a utility process or worker; talk to it from the rest of the app over the **IPC transport** (`NodeIpcClient` on a `MessagePort`). Same API, no network hop. |
-| **IoT gateways / device mesh.** An edge gateway aggregates many serial devices; a cloud service addresses them dynamically and neither side has a stable address. | Use **mux mode** (one connection, ports addressed by `path` in the payload) and/or the **MQTT transport** so both sides only need to know the broker. |
+Find your scenario in the table, then click through to a complete copy-paste recipe.
+
+| Scenario | Why this library helps | Jump to code |
+|---|---|---|
+| **Remote industrial / lab equipment.** A PLC, Modbus energy meter, RS-485 sensor bus, or bench instrument sits on a factory floor or a lab rack; your control / monitoring code runs on a server, a dev laptop, or a cloud VM. | Run `remote-serialport-server` on the small box wired to the equipment. Run your existing `modbus-serial` / `serialport` code anywhere and point it at a *virtual* port — almost zero code change. | [Modbus recipe →](#recipe-modbus) |
+| **Containerised / Kubernetes apps.** A container can't see host `/dev/ttyUSB0` without privileged device passthrough. | Run the server on the host (or one privileged sidecar); let unprivileged app containers connect over the network. No `--device`, no `--privileged`. | [Container recipe →](#recipe-container) |
+| **Shared access to one instrument.** Several engineers — or several services — need the same RS-485 line at once. | `multi_access: 'shared'` refcounts a single physical port, fans reads out to every client, and the `shared_mode` policy table arbitrates writes (FIFO, single-writer, COW snapshot, …). | [Shared-instrument recipe →](#recipe-shared) |
+| **Hardware-in-the-loop CI / test farms.** The device under test lives in a test rack; CI runners are elsewhere or ephemeral. | The server keeps the port; each CI job connects, runs, disconnects. Or inject a mock-backed `serialport_factory` and run the *same* suite with no hardware at all. | [CI recipe →](#recipe-ci) |
+| **Electron / multi-process desktop apps.** The native `serialport` binding shouldn't load in your renderer process. | Keep `serialport` in a utility process or worker; talk to it from the rest of the app over the **IPC transport** (`NodeIpcClient` on a `MessagePort`). Same API, no network hop. | [IPC recipe →](#recipe-ipc) |
+| **IoT gateways / device mesh.** An edge gateway aggregates many serial devices; a cloud service addresses them dynamically and neither side has a stable address. | Use **mux mode** (one connection, ports addressed by `path` in the payload) and/or the **MQTT transport** so both sides only need to know the broker. | [Gateway recipe →](#recipe-gateway) |
 
 > **Not for browsers.** This is a Node.js library (see the warning at the top). For a browser
 > front-end, put `remote-serialport` on a Node backend and expose your own app-layer API to the
@@ -133,6 +135,187 @@ port.on("error", (err) => console.error("port error:", err.message));
 (`modbus-serial`, `@serialport/parser-*`, …) takes it unchanged. The rest of this README drills
 into each capability; the [server README](../remote-serialport-server/README.md) covers the
 server side in the same depth.
+
+## Recipes — pick your scenario
+
+Each recipe is a complete, copy-paste starting point. Unless noted otherwise they assume the
+[Quick start](#quick-start--a-complete-echo-example) server is running.
+
+<a id="recipe-modbus"></a>
+
+### Recipe — remote Modbus equipment
+
+> A Modbus RTU meter / PLC on a remote site; you poll it from an office server. The socket.io
+> transport auto-reconnects, so a flaky site uplink stays transparent to your polling loop.
+
+```javascript
+// client.js — poll a Modbus RTU device that lives on a remote site
+const { RemoteSerialportClient } = require("node-serialport-client");
+const ModbusRTU = require("modbus-serial");
+
+const rsc = new RemoteSerialportClient("ws://site-gateway.local:17991");
+
+const conn = rsc.connect("/dev/ttyUSB0", { path: "/dev/ttyUSB0", baudRate: 9600 });
+const port = conn.create_port("/dev/ttyV0").get_port({ baudRate: 9600 });
+
+const modbus = new ModbusRTU(port);
+modbus.setID(1);
+modbus.setTimeout(2000);
+
+setInterval(async () => {
+  try {
+    const { data } = await modbus.readHoldingRegisters(0, 4);
+    console.log("holding registers:", data);
+  } catch (err) {
+    console.error("poll failed:", err.message); // transport blip or device timeout
+  }
+}, 5000);
+```
+
+<a id="recipe-container"></a>
+
+### Recipe — run inside a container
+
+> The client code is identical to every other recipe — only the *deployment* differs. The server
+> runs on the host and owns the real device; unprivileged containers reach it over the network.
+
+```bash
+# on the HOST (has the real /dev/ttyUSB0)
+node server.js                       # the Quick start server, listening on :17991
+
+# the APP container — note: no --device, no --privileged
+docker run --rm \
+  --add-host host.docker.internal:host-gateway \
+  my-serial-app
+```
+
+```javascript
+// app.js, inside the container — just the Quick start client, pointed at the host
+const { RemoteSerialportClient } = require("node-serialport-client");
+
+const rsc = new RemoteSerialportClient("ws://host.docker.internal:17991");
+const conn = rsc.connect("/dev/ttyUSB0", { path: "/dev/ttyUSB0", baudRate: 115200 });
+const port = conn.create_port("/dev/ttyV0").get_port({ baudRate: 115200, autoOpen: true });
+
+port.on("data", (d) => console.log("from device:", d));
+```
+
+<a id="recipe-shared"></a>
+
+### Recipe — share one instrument across clients
+
+> Several processes need the same RS-485 line at once. Turn on shared mode on the server; every
+> client gets its own virtual port and all of them see the device's output.
+
+```javascript
+// server.js
+const { RemoteSerialportServer } = require("node-serialport-server");
+
+const server = new RemoteSerialportServer({ cors: { origin: "*" } }, 17991, {
+  multi_access: "shared",
+  shared_mode: "fifo",   // writes serialised by arrival order; reads fan out to everyone
+});
+server.listen();
+server.of().on("connection", (socket) => socket.pipe());
+```
+
+```javascript
+// client-a.js / client-b.js — identical code, run as many as you like
+const { RemoteSerialportClient } = require("node-serialport-client");
+
+const rsc = new RemoteSerialportClient("ws://lab-host:17991");
+const conn = rsc.connect("/dev/ttyUSB0", { path: "/dev/ttyUSB0", baudRate: 115200 });
+const port = conn.create_port("/dev/ttyV0").get_port({ baudRate: 115200, autoOpen: true });
+
+port.on("data", (d) => console.log("shared device says:", d));
+port.on("open", () => port.write("STATUS?\r\n"));
+```
+
+See [Shared mode](#shared-mode-multi_access-shared) for the full `shared_mode` policy table.
+
+<a id="recipe-ci"></a>
+
+### Recipe — hardware-free CI tests
+
+> Run the whole suite with no physical port. Inject a mock-backed factory on the server; the client
+> code under test never knows the difference.
+
+```javascript
+// test-server.js
+const { RemoteSerialportServer } = require("node-serialport-server");
+const { SerialPortMock } = require("serialport");
+
+SerialPortMock.binding.createPort("/dev/ttyUSB0"); // spin up virtual hardware
+
+const server = new RemoteSerialportServer({ cors: { origin: "*" } }, 17991, {
+  serialport_factory: (opts) => new SerialPortMock(opts),
+  port_list_provider: () => [{ path: "/dev/ttyUSB0" }], // SerialPort.list() can't see mock ports
+});
+server.listen();
+server.of().on("connection", (socket) => socket.pipe());
+```
+
+The client side is your real application code, unchanged — point it at `ws://localhost:17991`.
+
+<a id="recipe-ipc"></a>
+
+### Recipe — Electron / multi-process desktop app
+
+> Keep the native `serialport` binding out of the renderer. Run the server in a utility process /
+> worker that owns the device; connect from elsewhere over a `MessagePort` — no network, same API.
+
+```javascript
+// in the process that runs the CLIENT (e.g. a worker), given a MessagePort `ipc_port`
+const { RemoteSerialportClient, NodeIpcClient } = require("node-serialport-client");
+
+const rsc = new RemoteSerialportClient("", {
+  transport_client: new NodeIpcClient(ipc_port, "/"), // mux mode: label is a placeholder
+});
+
+const mux = rsc.mux();
+mux.open("/dev/ttyUSB0", { path: "/dev/ttyUSB0", baudRate: 115200 });
+const port = mux.create_port("/dev/ttyUSB0", "/dev/ttyV0")
+  .get_port({ baudRate: 115200, autoOpen: true });
+
+port.on("data", (d) => console.log("from device:", d));
+```
+
+The matching server half (`NodeIpcServer` on the other `MessagePort`) is in the
+[server README](../remote-serialport-server/README.md); walkthrough
+[Script 5](../note/walkthrough/05-ipc-main.js) is a worked end-to-end example.
+
+<a id="recipe-gateway"></a>
+
+### Recipe — IoT gateway (mux + MQTT)
+
+> An edge gateway exposes many serial devices; a cloud service talks to all of them over one
+> connection, each addressed by `path`. With the MQTT transport, neither side needs the other's
+> network address — they only need to reach the broker.
+
+```javascript
+const { RemoteSerialportClient, MqttRsClient } = require("node-serialport-client");
+
+const rsc = new RemoteSerialportClient("", {
+  transport_client: new MqttRsClient({
+    broker_url: "mqtt://broker.internal:1883",
+    topic_prefix: "rsp",
+    qos: 1, // see the QoS-1 duplicate-write caveat before commanding actuators
+  }),
+});
+
+const mux = rsc.mux(); // one connection carries every port below
+mux.open("/dev/ttyUSB0", { path: "/dev/ttyUSB0", baudRate: 9600 });
+mux.open("/dev/ttyACM0", { path: "/dev/ttyACM0", baudRate: 115200 });
+
+const meter  = mux.create_port("/dev/ttyUSB0", "/dev/ttyV0").get_port({ baudRate: 9600,   autoOpen: true });
+const sensor = mux.create_port("/dev/ttyACM0", "/dev/ttyV1").get_port({ baudRate: 115200, autoOpen: true });
+
+meter.on("data",  (d) => console.log("meter:",  d));
+sensor.on("data", (d) => console.log("sensor:", d));
+```
+
+See [Mux mode](#mux-mode-1) and the [MQTT broker pattern](#mqtt-broker-pattern-mqttrsclient) for
+the full options and caveats.
 
 ## Server
 
@@ -868,14 +1051,16 @@ crosses 1 MB; resumes once below 256 KB. Only in `multi_access: 'reject'` mode (
 
 要解決的核心問題：**想跟序列裝置溝通的「程式」，跟裝置實際插著的「機器」，不是同一台** — 或不是同一個 process、不是同一個 container。如果裝置跟程式在同一個 process，你不需要這個 library，直接用 `serialport` 就好。下面任一條成立時才用 `remote-serialport`：
 
-| 場景 | 這個 library 怎麼幫上忙 |
-|---|---|
-| **遠端工控 / 實驗室設備。** PLC、Modbus 電錶、RS-485 sensor bus、桌上型儀器在工廠現場或實驗室機架；你的控制 / 監測程式跑在伺服器、開發筆電或雲端 VM。 | 在接著設備的小主機上跑 `remote-serialport-server`。既有的 `modbus-serial` / `serialport` 程式碼放哪都行，指向一個*虛擬*埠 — 幾乎零修改。 |
-| **容器化 / Kubernetes 應用。** Container 沒有 privileged device passthrough 就看不到 host 的 `/dev/ttyUSB0`。 | server 跑在 host（或一個 privileged sidecar）；讓非特權的 app container 走網路連進來。不用 `--device`、不用 `--privileged`。 |
-| **多人共用一台儀器。** 多個工程師 — 或多個服務 — 要同時用同一條 RS-485 線。 | `multi_access: 'shared'` 對單一實體埠 refcount，讀方向 fanout 給每個 client，`shared_mode` 政策表決定寫方向的仲裁（FIFO、單一 writer、COW snapshot…）。 |
-| **硬體在環 (HIL) CI / 測試農場。** 待測裝置在測試機架；CI runner 在別處或是用完即丟。 | server 守著埠；每個 CI job 連上、跑、斷開。或注入 mock 撐起來的 `serialport_factory`，完全沒硬體也能跑*同一套*測試。 |
-| **Electron / 多 process 桌面應用。** native `serialport` binding 不該載進 renderer process。 | 把 `serialport` 留在 utility process 或 worker；app 其它部分透過 **IPC transport**（`NodeIpcClient` 跑在 `MessagePort` 上）跟它講話。同一套 API、沒有網路跳轉。 |
-| **IoT 閘道 / 裝置 mesh。** 邊緣閘道彙整多個序列裝置；雲端服務動態定址，且兩邊都沒有固定位址。 | 用 **mux mode**（一條連線、埠由 payload 內的 `path` 定址）和／或 **MQTT transport**，這樣雙方只需要知道 broker。 |
+在表格裡找到你的場景，點進去就是一份完整、可直接 copy-paste 的範例。
+
+| 場景 | 這個 library 怎麼幫上忙 | 範例程式碼 |
+|---|---|---|
+| **遠端工控 / 實驗室設備。** PLC、Modbus 電錶、RS-485 sensor bus、桌上型儀器在工廠現場或實驗室機架；你的控制 / 監測程式跑在伺服器、開發筆電或雲端 VM。 | 在接著設備的小主機上跑 `remote-serialport-server`。既有的 `modbus-serial` / `serialport` 程式碼放哪都行，指向一個*虛擬*埠 — 幾乎零修改。 | [Modbus 範例 →](#recipe-zh-modbus) |
+| **容器化 / Kubernetes 應用。** Container 沒有 privileged device passthrough 就看不到 host 的 `/dev/ttyUSB0`。 | server 跑在 host（或一個 privileged sidecar）；讓非特權的 app container 走網路連進來。不用 `--device`、不用 `--privileged`。 | [容器範例 →](#recipe-zh-container) |
+| **多人共用一台儀器。** 多個工程師 — 或多個服務 — 要同時用同一條 RS-485 線。 | `multi_access: 'shared'` 對單一實體埠 refcount，讀方向 fanout 給每個 client，`shared_mode` 政策表決定寫方向的仲裁（FIFO、單一 writer、COW snapshot…）。 | [共用儀器範例 →](#recipe-zh-shared) |
+| **硬體在環 (HIL) CI / 測試農場。** 待測裝置在測試機架；CI runner 在別處或是用完即丟。 | server 守著埠；每個 CI job 連上、跑、斷開。或注入 mock 撐起來的 `serialport_factory`，完全沒硬體也能跑*同一套*測試。 | [CI 範例 →](#recipe-zh-ci) |
+| **Electron / 多 process 桌面應用。** native `serialport` binding 不該載進 renderer process。 | 把 `serialport` 留在 utility process 或 worker；app 其它部分透過 **IPC transport**（`NodeIpcClient` 跑在 `MessagePort` 上）跟它講話。同一套 API、沒有網路跳轉。 | [IPC 範例 →](#recipe-zh-ipc) |
+| **IoT 閘道 / 裝置 mesh。** 邊緣閘道彙整多個序列裝置；雲端服務動態定址，且兩邊都沒有固定位址。 | 用 **mux mode**（一條連線、埠由 payload 內的 `path` 定址）和／或 **MQTT transport**，這樣雙方只需要知道 broker。 | [閘道範例 →](#recipe-zh-gateway) |
 
 > **不支援瀏覽器。** 這是 Node.js library（見最上方警告）。要做瀏覽器前端，請把 `remote-serialport` 放在 Node 後端，再對瀏覽器暴露你自己的 app-layer API。
 
@@ -938,6 +1123,176 @@ port.on("error", (err) => console.error("port error:", err.message));
 ```
 
 `port` 就是個普通的 `SerialPortStream` — 任何已經吃 serialport instance 的 library（`modbus-serial`、`@serialport/parser-*`…）原封不動就能用。本 README 後面逐項深入各功能；server 側細節同樣深度請見 [server README](../remote-serialport-server/README.md)。
+
+### 場景範例 — 找到你的情境
+
+每個範例都是完整、可直接 copy-paste 的起點。除非另有說明，都假設[快速開始](#快速開始--完整-echo-範例)的 server 正在跑。
+
+<a id="recipe-zh-modbus"></a>
+
+#### 範例 — 遠端 Modbus 設備
+
+> Modbus RTU 電錶 / PLC 在遠端站點；你從辦公室伺服器輪詢它。socket.io transport 會自動重連，所以站點上行鏈路偶爾斷一下，對你的輪詢迴圈是透明的。
+
+```javascript
+// client.js — 輪詢一個位於遠端站點的 Modbus RTU 設備
+const { RemoteSerialportClient } = require("node-serialport-client");
+const ModbusRTU = require("modbus-serial");
+
+const rsc = new RemoteSerialportClient("ws://site-gateway.local:17991");
+
+const conn = rsc.connect("/dev/ttyUSB0", { path: "/dev/ttyUSB0", baudRate: 9600 });
+const port = conn.create_port("/dev/ttyV0").get_port({ baudRate: 9600 });
+
+const modbus = new ModbusRTU(port);
+modbus.setID(1);
+modbus.setTimeout(2000);
+
+setInterval(async () => {
+  try {
+    const { data } = await modbus.readHoldingRegisters(0, 4);
+    console.log("holding registers:", data);
+  } catch (err) {
+    console.error("輪詢失敗:", err.message); // transport 短斷或裝置 timeout
+  }
+}, 5000);
+```
+
+<a id="recipe-zh-container"></a>
+
+#### 範例 — 在容器內執行
+
+> client 程式碼跟其它範例完全一樣 — 只有*部署方式*不同。server 跑在 host 上、持有真實裝置；非特權容器走網路連進來。
+
+```bash
+# 在 HOST 上（有真實的 /dev/ttyUSB0）
+node server.js                       # 快速開始的 server，監聽 :17991
+
+# APP 容器 — 注意：不用 --device、不用 --privileged
+docker run --rm \
+  --add-host host.docker.internal:host-gateway \
+  my-serial-app
+```
+
+```javascript
+// 容器內的 app.js — 就是快速開始的 client，指向 host
+const { RemoteSerialportClient } = require("node-serialport-client");
+
+const rsc = new RemoteSerialportClient("ws://host.docker.internal:17991");
+const conn = rsc.connect("/dev/ttyUSB0", { path: "/dev/ttyUSB0", baudRate: 115200 });
+const port = conn.create_port("/dev/ttyV0").get_port({ baudRate: 115200, autoOpen: true });
+
+port.on("data", (d) => console.log("from device:", d));
+```
+
+<a id="recipe-zh-shared"></a>
+
+#### 範例 — 多個 client 共用一台儀器
+
+> 多個 process 要同時用同一條 RS-485 線。在 server 開啟 shared mode；每個 client 拿到自己的虛擬埠，而且全部都看得到裝置的輸出。
+
+```javascript
+// server.js
+const { RemoteSerialportServer } = require("node-serialport-server");
+
+const server = new RemoteSerialportServer({ cors: { origin: "*" } }, 17991, {
+  multi_access: "shared",
+  shared_mode: "fifo",   // 寫入按抵達順序序列化；讀方向 fanout 給所有人
+});
+server.listen();
+server.of().on("connection", (socket) => socket.pipe());
+```
+
+```javascript
+// client-a.js / client-b.js — 程式碼相同，要開幾個都行
+const { RemoteSerialportClient } = require("node-serialport-client");
+
+const rsc = new RemoteSerialportClient("ws://lab-host:17991");
+const conn = rsc.connect("/dev/ttyUSB0", { path: "/dev/ttyUSB0", baudRate: 115200 });
+const port = conn.create_port("/dev/ttyV0").get_port({ baudRate: 115200, autoOpen: true });
+
+port.on("data", (d) => console.log("shared device says:", d));
+port.on("open", () => port.write("STATUS?\r\n"));
+```
+
+完整的 `shared_mode` 政策表見 [Shared mode](#shared-mode-multi_access-shared) 英文段。
+
+<a id="recipe-zh-ci"></a>
+
+#### 範例 — 無硬體 CI 測試
+
+> 整套測試完全不用實體埠。在 server 注入 mock 撐起來的 factory；待測的 client 程式碼根本不知道差別。
+
+```javascript
+// test-server.js
+const { RemoteSerialportServer } = require("node-serialport-server");
+const { SerialPortMock } = require("serialport");
+
+SerialPortMock.binding.createPort("/dev/ttyUSB0"); // 拉起虛擬硬體
+
+const server = new RemoteSerialportServer({ cors: { origin: "*" } }, 17991, {
+  serialport_factory: (opts) => new SerialPortMock(opts),
+  port_list_provider: () => [{ path: "/dev/ttyUSB0" }], // SerialPort.list() 看不到 mock 埠
+});
+server.listen();
+server.of().on("connection", (socket) => socket.pipe());
+```
+
+client 端就是你真正的應用程式碼，原封不動 — 指向 `ws://localhost:17991` 即可。
+
+<a id="recipe-zh-ipc"></a>
+
+#### 範例 — Electron / 多 process 桌面應用
+
+> 把 native `serialport` binding 擋在 renderer 外。server 跑在持有裝置的 utility process / worker；其它地方透過 `MessagePort` 連進來 — 不走網路、同一套 API。
+
+```javascript
+// 在跑 CLIENT 的 process 裡（例如 worker），已拿到一個 MessagePort `ipc_port`
+const { RemoteSerialportClient, NodeIpcClient } = require("node-serialport-client");
+
+const rsc = new RemoteSerialportClient("", {
+  transport_client: new NodeIpcClient(ipc_port, "/"), // mux mode：label 是 placeholder
+});
+
+const mux = rsc.mux();
+mux.open("/dev/ttyUSB0", { path: "/dev/ttyUSB0", baudRate: 115200 });
+const port = mux.create_port("/dev/ttyUSB0", "/dev/ttyV0")
+  .get_port({ baudRate: 115200, autoOpen: true });
+
+port.on("data", (d) => console.log("from device:", d));
+```
+
+對應的 server 半邊（另一個 `MessagePort` 上的 `NodeIpcServer`）見 [server README](../remote-serialport-server/README.md)；walkthrough 的 [Script 5](../note/walkthrough/05-ipc-main.js) 是一個完整端到端的可跑範例。
+
+<a id="recipe-zh-gateway"></a>
+
+#### 範例 — IoT 閘道（mux + MQTT）
+
+> 邊緣閘道暴露多個序列裝置；雲端服務透過一條連線跟它們全部講話，各埠用 `path` 定址。用 MQTT transport，雙方都不需要知道對方的網路位址 — 只要連得到 broker。
+
+```javascript
+const { RemoteSerialportClient, MqttRsClient } = require("node-serialport-client");
+
+const rsc = new RemoteSerialportClient("", {
+  transport_client: new MqttRsClient({
+    broker_url: "mqtt://broker.internal:1883",
+    topic_prefix: "rsp",
+    qos: 1, // 操作 actuator 前請先看 QoS-1 重複寫入的雷
+  }),
+});
+
+const mux = rsc.mux(); // 一條連線承載下面所有埠
+mux.open("/dev/ttyUSB0", { path: "/dev/ttyUSB0", baudRate: 9600 });
+mux.open("/dev/ttyACM0", { path: "/dev/ttyACM0", baudRate: 115200 });
+
+const meter  = mux.create_port("/dev/ttyUSB0", "/dev/ttyV0").get_port({ baudRate: 9600,   autoOpen: true });
+const sensor = mux.create_port("/dev/ttyACM0", "/dev/ttyV1").get_port({ baudRate: 115200, autoOpen: true });
+
+meter.on("data",  (d) => console.log("meter:",  d));
+sensor.on("data", (d) => console.log("sensor:", d));
+```
+
+完整選項與雷點見 [Mux mode](#mux-mode-1) 跟 [MQTT broker pattern](#mqtt-broker-pattern-mqttrsclient) 英文段。
 
 ### 兩種模式
 
