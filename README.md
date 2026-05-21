@@ -30,6 +30,26 @@ This project is split into three packages:
 > `src/types/remote-serialport-types`. After `git submodule update --init`, run `npm install` **inside
 > that submodule directory too** (it has its own dependencies) so `tsc` resolves all types.
 
+## Use cases — when do you need this?
+
+The core problem this solves: **the code that wants to talk to a serial device, and the machine the
+device is physically plugged into, are not the same machine** — or not the same process, or not the
+same container. If your device and your code share a process, you don't need this; just use
+`serialport` directly. You want `remote-serialport` when one of these is true:
+
+| Scenario | Why this library helps |
+|---|---|
+| **Remote industrial / lab equipment.** A PLC, Modbus energy meter, RS-485 sensor bus, or bench instrument sits on a factory floor or a lab rack; your control / monitoring code runs on a server, a dev laptop, or a cloud VM. | Run `remote-serialport-server` on the small box wired to the equipment. Run your existing `modbus-serial` / `serialport` code anywhere and point it at a *virtual* port — almost zero code change. |
+| **Containerised / Kubernetes apps.** A container can't see host `/dev/ttyUSB0` without privileged device passthrough. | Run the server on the host (or one privileged sidecar); let unprivileged app containers connect over the network. No `--device`, no `--privileged`. |
+| **Shared access to one instrument.** Several engineers — or several services — need the same RS-485 line at once. | `multi_access: 'shared'` refcounts a single physical port, fans reads out to every client, and the `shared_mode` policy table arbitrates writes (FIFO, single-writer, COW snapshot, …). |
+| **Hardware-in-the-loop CI / test farms.** The device under test lives in a test rack; CI runners are elsewhere or ephemeral. | The server keeps the port; each CI job connects, runs, disconnects. Or inject a mock-backed `serialport_factory` and run the *same* suite with no hardware at all. |
+| **Electron / multi-process desktop apps.** The native `serialport` binding shouldn't load in your renderer process. | Keep `serialport` in a utility process or worker; talk to it from the rest of the app over the **IPC transport** (`NodeIpcClient` on a `MessagePort`). Same API, no network hop. |
+| **IoT gateways / device mesh.** An edge gateway aggregates many serial devices; a cloud service addresses them dynamically and neither side has a stable address. | Use **mux mode** (one connection, ports addressed by `path` in the payload) and/or the **MQTT transport** so both sides only need to know the broker. |
+
+> **Not for browsers.** This is a Node.js library (see the warning at the top). For a browser
+> front-end, put `remote-serialport` on a Node backend and expose your own app-layer API to the
+> browser.
+
 ## Two modes
 
 - **Namespace mode** — one socket.io namespace = one remote serial port. `client.connect("/dev/ttyUSB0", …)`.
@@ -49,6 +69,70 @@ identifies the port (namespace mode, payloads are raw bytes) or each payload car
 npm install node-serialport-server   # server
 npm install node-serialport-client   # client
 ```
+
+## Quick start — a complete echo example
+
+A minimal end-to-end pair. Run the **server** on the machine with the serial hardware; run the
+**client** anywhere that can reach it over the network.
+
+**`server.js`** — on the host with `/dev/ttyUSB0` physically attached:
+
+```javascript
+const { RemoteSerialportServer } = require("node-serialport-server");
+
+const server = new RemoteSerialportServer(
+  { cors: { origin: "*" } }, // socket.io ServerOptions
+  17991                      // listen port
+);
+server.listen();
+
+server.of().on("connection", (socket) => {
+  // Write direction (client -> device) is wired automatically.
+  socket.pipe(); // forward read direction (device -> client)
+
+  socket.port.on("data", (chunk) =>
+    console.log(`device sent ${chunk.length} bytes`));
+  console.log("client connected, proxying", socket.port.path);
+});
+
+console.log("remote-serialport server listening on :17991");
+```
+
+**`client.js`** — on any other machine (replace the IP with the server's):
+
+```javascript
+const { RemoteSerialportClient } = require("node-serialport-client");
+const { ReadlineParser } = require("serialport");
+
+const rsc = new RemoteSerialportClient("ws://192.168.1.50:17991");
+
+// 1st arg = socket.io namespace; options.path = the real remote serial path.
+const conn = rsc.connect("/dev/ttyUSB0", {
+  path: "/dev/ttyUSB0",
+  baudRate: 115200,
+});
+
+// Map the remote port to a LOCAL virtual port path; get a SerialPortStream.
+const port = conn
+  .create_port("/dev/ttyV0")
+  .get_port({ baudRate: 115200, autoOpen: true });
+
+// Read: device -> here
+port.pipe(new ReadlineParser({ delimiter: "\r\n" }))
+    .on("data", (line) => console.log("line from device:", line));
+
+// Write: here -> device (forwarded to the real physical port)
+port.on("open", () => port.write("PING\r\n"));
+
+port.on("error", (err) => console.error("port error:", err.message));
+
+// When done: rsc.disconnect();
+```
+
+`port` is an ordinary `SerialPortStream` — any library that already accepts a serialport instance
+(`modbus-serial`, `@serialport/parser-*`, …) takes it unchanged. The rest of this README drills
+into each capability; the [server README](../remote-serialport-server/README.md) covers the
+server side in the same depth.
 
 ## Server
 
@@ -391,6 +475,23 @@ server's logger and `serialport_state: ERROR` payload carry the reason.
 The default transport is **socket.io-client**; a second built-in transport speaks **Node IPC**
 (`worker_threads.MessagePort` / Electron utility process `MessagePort`). Swap by injecting
 `transport_client` into the constructor.
+
+#### Choosing a transport
+
+All transports speak the same protocol — pick by deployment shape, not by feature. Quick guide:
+
+| Transport | Class | Reach for it when… | Watch out for |
+|---|---|---|---|
+| **socket.io** (default) | — | You want auto-reconnect, RPC replay, and Engine.IO's polling fallback. The safe default for anything over a real network. | Slightly lower raw throughput (~18 MB/s localhost). |
+| **Node IPC** | `NodeIpcClient` | Server and client are different *processes on the same host* — Electron utility process, `worker_threads`. No network at all. | Single endpoint per `MessagePort` pair → use mux mode. No reconnect. |
+| **Raw TCP / UDS / Pipe** | `RawTcpClient` | Trusted LAN and you want the thinnest path; or a same-host Unix socket / named pipe. | Single-shot — no auto-reconnect. |
+| **Raw WebSocket** | `RawWebSocketClient` | You want WebSocket semantics without Engine.IO's overhead. Highest WS throughput (~44 MB/s localhost). | Single-shot — no auto-reconnect / fallback. |
+| **HTTP/2** | `Http2Client` | Many ports on one connection and you care about tail latency — per-stream flow control, no head-of-line blocking. Best p99 (~1.5 ms locally). | — |
+| **MQTT** | `MqttRsClient` | Decoupled deployment: server and clients only know a broker's address (NAT on both sides, intermittent links). | Highest latency; QoS-1 duplicate-write caveat (see below). |
+| **gRPC** | `GrpcClient` | Your infrastructure is already gRPC-native (service mesh, existing `.proto` tooling). | — |
+| **WebRTC** | `WebRtcClient` | True peer-to-peer with NAT traversal, no server in the data path. | Experimental; bring your own signaling. |
+
+The subsections below give a runnable example and the full options table for each.
 
 > **IPC `label` is the serial port path (namespace mode).** `new NodeIpcClient(port, label)` —
 > in **namespace mode** the `label` you pass MUST match the path the server expects (which on
@@ -763,6 +864,81 @@ crosses 1 MB; resumes once below 256 KB. Only in `multi_access: 'reject'` mode (
 
 > **從原始碼開發？** `types` package 以 submodule 內嵌在 `src/types/remote-serialport-types`。`git submodule update --init` 後**也要進那個目錄跑一次 `npm install`**（它有自己的依賴），`tsc` 才能解析所有型別。
 
+### 使用場景 — 什麼時候會需要它？
+
+要解決的核心問題：**想跟序列裝置溝通的「程式」，跟裝置實際插著的「機器」，不是同一台** — 或不是同一個 process、不是同一個 container。如果裝置跟程式在同一個 process，你不需要這個 library，直接用 `serialport` 就好。下面任一條成立時才用 `remote-serialport`：
+
+| 場景 | 這個 library 怎麼幫上忙 |
+|---|---|
+| **遠端工控 / 實驗室設備。** PLC、Modbus 電錶、RS-485 sensor bus、桌上型儀器在工廠現場或實驗室機架；你的控制 / 監測程式跑在伺服器、開發筆電或雲端 VM。 | 在接著設備的小主機上跑 `remote-serialport-server`。既有的 `modbus-serial` / `serialport` 程式碼放哪都行，指向一個*虛擬*埠 — 幾乎零修改。 |
+| **容器化 / Kubernetes 應用。** Container 沒有 privileged device passthrough 就看不到 host 的 `/dev/ttyUSB0`。 | server 跑在 host（或一個 privileged sidecar）；讓非特權的 app container 走網路連進來。不用 `--device`、不用 `--privileged`。 |
+| **多人共用一台儀器。** 多個工程師 — 或多個服務 — 要同時用同一條 RS-485 線。 | `multi_access: 'shared'` 對單一實體埠 refcount，讀方向 fanout 給每個 client，`shared_mode` 政策表決定寫方向的仲裁（FIFO、單一 writer、COW snapshot…）。 |
+| **硬體在環 (HIL) CI / 測試農場。** 待測裝置在測試機架；CI runner 在別處或是用完即丟。 | server 守著埠；每個 CI job 連上、跑、斷開。或注入 mock 撐起來的 `serialport_factory`，完全沒硬體也能跑*同一套*測試。 |
+| **Electron / 多 process 桌面應用。** native `serialport` binding 不該載進 renderer process。 | 把 `serialport` 留在 utility process 或 worker；app 其它部分透過 **IPC transport**（`NodeIpcClient` 跑在 `MessagePort` 上）跟它講話。同一套 API、沒有網路跳轉。 |
+| **IoT 閘道 / 裝置 mesh。** 邊緣閘道彙整多個序列裝置；雲端服務動態定址，且兩邊都沒有固定位址。 | 用 **mux mode**（一條連線、埠由 payload 內的 `path` 定址）和／或 **MQTT transport**，這樣雙方只需要知道 broker。 |
+
+> **不支援瀏覽器。** 這是 Node.js library（見最上方警告）。要做瀏覽器前端，請把 `remote-serialport` 放在 Node 後端，再對瀏覽器暴露你自己的 app-layer API。
+
+### 快速開始 — 完整 echo 範例
+
+一組最小的端到端範例。**server** 跑在有序列硬體的機器上；**client** 放在任何連得到它的地方。
+
+**`server.js`** — 在實體插著 `/dev/ttyUSB0` 的 host 上：
+
+```javascript
+const { RemoteSerialportServer } = require("node-serialport-server");
+
+const server = new RemoteSerialportServer(
+  { cors: { origin: "*" } }, // socket.io ServerOptions
+  17991                      // 監聽埠
+);
+server.listen();
+
+server.of().on("connection", (socket) => {
+  // 寫方向（client -> device）會自動接好。
+  socket.pipe(); // forward 讀方向（device -> client）
+
+  socket.port.on("data", (chunk) =>
+    console.log(`device 送來 ${chunk.length} bytes`));
+  console.log("client 已連上，proxy 中：", socket.port.path);
+});
+
+console.log("remote-serialport server 監聽於 :17991");
+```
+
+**`client.js`** — 任何另一台機器（IP 換成 server 的）：
+
+```javascript
+const { RemoteSerialportClient } = require("node-serialport-client");
+const { ReadlineParser } = require("serialport");
+
+const rsc = new RemoteSerialportClient("ws://192.168.1.50:17991");
+
+// 第 1 個參數 = socket.io namespace；options.path = 遠端真實序列埠路徑。
+const conn = rsc.connect("/dev/ttyUSB0", {
+  path: "/dev/ttyUSB0",
+  baudRate: 115200,
+});
+
+// 把遠端埠對應到一個「本地」虛擬埠路徑；拿到 SerialPortStream。
+const port = conn
+  .create_port("/dev/ttyV0")
+  .get_port({ baudRate: 115200, autoOpen: true });
+
+// 讀：device -> 這裡
+port.pipe(new ReadlineParser({ delimiter: "\r\n" }))
+    .on("data", (line) => console.log("device 來的一行：", line));
+
+// 寫：這裡 -> device（轉發到實體埠）
+port.on("open", () => port.write("PING\r\n"));
+
+port.on("error", (err) => console.error("port error:", err.message));
+
+// 結束時：rsc.disconnect();
+```
+
+`port` 就是個普通的 `SerialPortStream` — 任何已經吃 serialport instance 的 library（`modbus-serial`、`@serialport/parser-*`…）原封不動就能用。本 README 後面逐項深入各功能；server 側細節同樣深度請見 [server README](../remote-serialport-server/README.md)。
+
 ### 兩種模式
 
 - **Namespace mode** — 一個 socket.io namespace = 一個遠端序列埠。`client.connect("/dev/ttyUSB0", …)`。simple、socket.io 慣用；多個 `connect()` 共用同一條傳輸通道（socket.io namespace 多工），所以單一連線仍可承載多埠。
@@ -913,7 +1089,26 @@ Server 拒絕 auth 時：連線關閉、handshake 永遠不會收到 — 本地�
 
 ### Transports（`AbsTransport`）
 
-預設 transport 是 socket.io-client；另一個內建是 **Node IPC**（`worker_threads.MessagePort` / Electron utility process `MessagePort`）。透過 ctor option `transport_client` 注入切換。範例：
+預設 transport 是 socket.io-client；另一個內建是 **Node IPC**（`worker_threads.MessagePort` / Electron utility process `MessagePort`）。透過 ctor option `transport_client` 注入切換。
+
+#### 怎麼選 transport
+
+所有 transport 講同一套協定 — 按「部署形狀」選，不是按功能選。快速指引：
+
+| Transport | Class | 什麼時候用 | 注意 |
+|---|---|---|---|
+| **socket.io**（預設） | — | 要自動重連、RPC replay、Engine.IO polling fallback。任何走真實網路的場景的安全預設。 | raw throughput 略低（localhost 實測 ~18 MB/s）。 |
+| **Node IPC** | `NodeIpcClient` | server 跟 client 是*同一台主機上的不同 process* — Electron utility process、`worker_threads`。完全不走網路。 | 一個 `MessagePort` pair 只有單一 endpoint → 用 mux mode。不重連。 |
+| **Raw TCP / UDS / Pipe** | `RawTcpClient` | 信任的 LAN、要最薄的路徑；或同主機的 Unix socket / named pipe。 | single-shot — 不自動重連。 |
+| **Raw WebSocket** | `RawWebSocketClient` | 要 WebSocket 語意但不要 Engine.IO 的額外開銷。WS throughput 最高（localhost ~44 MB/s）。 | single-shot — 不自動重連 / fallback。 |
+| **HTTP/2** | `Http2Client` | 一條連線承載多埠且在意尾端延遲 — per-stream flow control、無 HOL blocking。p99 最佳（localhost ~1.5 ms）。 | — |
+| **MQTT** | `MqttRsClient` | 解耦部署：server 跟 client 只認得 broker 位址（兩邊都在 NAT 後、連線時斷時續）。 | 延遲最差；QoS-1 重複寫入的雷（見下）。 |
+| **gRPC** | `GrpcClient` | 你的基礎設施本來就是 gRPC（service mesh、既有 `.proto` 工具鏈）。 | — |
+| **WebRTC** | `WebRtcClient` | 真 P2P + NAT 穿透，data path 上沒有 server。 | experimental；signaling 自己準備。 |
+
+下面各小節給每種 transport 一個可跑的範例與完整選項表。
+
+socket.io / IPC 範例：
 
 ```javascript
 import { MessageChannel } from "worker_threads";
